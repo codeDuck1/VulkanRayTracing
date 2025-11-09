@@ -82,6 +82,13 @@
 #include "common/utils.hpp"       // Common utilities for the sample application
 #include "common/path_utils.hpp"  // Path utilities for handling resources file paths
 
+
+/// <summary>
+/// Convert mesh data to acceleration structure geometry
+/// </summary>
+void primitiveToGeometry(const shaderio::GltfMesh&                 gltfMesh,
+                        VkAccelerationStructureGeometryKHR&       geometry,
+                        VkAccelerationStructureBuildRangeInfoKHR& rangeInfo);
 //---------------------------------------------------------------------------------------
 // Ray Tracing Tutorial
 //
@@ -208,6 +215,14 @@ public:
     m_skySimple.deinit();
     m_tonemapper.deinit();
     m_samplerPool.deinit();
+
+    // Cleanup acceleration structures
+    for(auto& blas : m_blasAccel)
+    {
+      m_allocator.destroyAcceleration(blas);
+    }
+    m_allocator.destroyAcceleration(m_tlasAccel);
+
     m_allocator.deinit();
   }
 
@@ -774,13 +789,21 @@ public:
     // Prepare geometry information for all meshes
     m_blasAccel.resize(m_sceneResource.meshes.size());
 
-    // For now, just log that we're ready to build BLAS
-    LOGI("  Ready to build %zu bottom-level acceleration structures\n", m_sceneResource.meshes.size());
+    // One BLAS per mesh
+    for(uint32_t blasId = 0; blasId < m_sceneResource.meshes.size(); blasId++)
+    {
+      VkAccelerationStructureGeometryKHR       asGeometry{};
+      VkAccelerationStructureBuildRangeInfoKHR asBuildRangeInfo{};
 
-    // TODO: In Phase 3, we'll add the actual building:
-    // For each mesh
-    //   - create acceleration structure geometry from internal mesh primitive (primitiveToGeometry)
-    //   - create acceleration structure
+      // Convert the mesh information to acceleration structure geometry
+      primitiveToGeometry(m_sceneResource.meshes[blasId], asGeometry, asBuildRangeInfo);
+
+      createAccelerationStructure(VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR, m_blasAccel[blasId], asGeometry,
+                                  asBuildRangeInfo, VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR);
+      NVVK_DBG_NAME(m_blasAccel[blasId].accel);
+    }
+
+    LOGI("  Bottom-level acceleration structures built successfully\n");
   }
     
   void createTopLevelAS()
@@ -810,13 +833,43 @@ public:
       tlasInstances.emplace_back(asInstance);
     }
 
-    // For now, just log that we're ready to build TLAS
-    LOGI("  Ready to build top-level acceleration structure with %zu instances\n", tlasInstances.size());
+    // Then create the buffer with the instance data. Single TLAS including
+    // all scene instances
+    nvvk::Buffer tlasInstancesBuffer;
+    {
+      VkCommandBuffer cmd = m_app->createTempCmdBuffer();
 
-    // TODO: In Phase 3, we'll add the actual building:
-    // 1. Create and upload instance buffer
-    // 2. Create TLAS geometry from instances
-    // 3. Call createAccelerationStructure with TLAS type
+      // Create the instances buffer and upload the instance data
+      NVVK_CHECK(m_allocator.createBuffer(
+          tlasInstancesBuffer, std::span<VkAccelerationStructureInstanceKHR const>(tlasInstances).size_bytes(),
+          VK_BUFFER_USAGE_2_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR | VK_BUFFER_USAGE_2_SHADER_DEVICE_ADDRESS_BIT));
+      NVVK_CHECK(m_stagingUploader.appendBuffer(tlasInstancesBuffer, 0,
+                                                std::span<VkAccelerationStructureInstanceKHR const>(tlasInstances)));
+      NVVK_DBG_NAME(tlasInstancesBuffer.buffer);
+      m_stagingUploader.cmdUploadAppended(cmd);
+      m_app->submitAndWaitTempCmdBuffer(cmd);
+    }
+
+    // Then create the TLAS geometry
+    {
+      VkAccelerationStructureGeometryKHR       asGeometry{};
+      VkAccelerationStructureBuildRangeInfoKHR asBuildRangeInfo{};
+
+      // Convert the instance information to acceleration structure geometry, similar to primitiveToGeometry()
+      VkAccelerationStructureGeometryInstancesDataKHR geometryInstances{.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_INSTANCES_DATA_KHR,
+                                                                        .data = {.deviceAddress = tlasInstancesBuffer.address}};
+      asGeometry       = {.sType        = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR,
+                          .geometryType = VK_GEOMETRY_TYPE_INSTANCES_KHR,
+                          .geometry     = {.instances = geometryInstances}};
+      asBuildRangeInfo = {.primitiveCount = static_cast<uint32_t>(m_sceneResource.instances.size())};
+
+      createAccelerationStructure(VK_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR, m_tlasAccel, asGeometry,
+                                  asBuildRangeInfo, VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR);
+      NVVK_DBG_NAME(m_tlasAccel.accel);
+    }
+
+    LOGI("  Top-level acceleration structures built successfully\n");
+    m_allocator.destroyBuffer(tlasInstancesBuffer);  // Cleanup
   }
 
 
