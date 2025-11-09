@@ -170,6 +170,9 @@ public:
     prop2.pNext          = &m_rtProperties;
     vkGetPhysicalDeviceProperties2(m_app->getPhysicalDevice(), &prop2);
 
+    // Set up acceleration structure infrastructure
+    createBottomLevelAS();  // Set up BLAS infrastructure
+    createTopLevelAS();     // Set up TLAS infrastructure
   }
 
   //-------------------------------------------------------------------------------
@@ -695,6 +698,128 @@ public:
   // Accessor for camera manipulator
   std::shared_ptr<nvutils::CameraManipulator> getCameraManipulator() const { return m_cameraManip; }
 
+  // Generic function to create an acceleration structure (BLAS or TLAS)
+  // Note: This function creates and destroys a scratch buffer for each call.
+  // Not optimal but easier to read and understand. See Helper function for a better approach.
+  void createAccelerationStructure(VkAccelerationStructureTypeKHR asType,  // The type of acceleration structure (BLAS or TLAS)
+                                   nvvk::AccelerationStructure& accelStruct,  // The acceleration structure to create
+                                   VkAccelerationStructureGeometryKHR& asGeometry,  // The geometry to build the acceleration structure from
+                                   VkAccelerationStructureBuildRangeInfoKHR& asBuildRangeInfo,  // The range info for building the acceleration structure
+                                   VkBuildAccelerationStructureFlagsKHR flags  // Build flags (e.g. prefer fast trace)
+  )
+  {
+    VkDevice device = m_app->getDevice();
+
+    // Helper function to align a value to a given alignment
+    auto alignUp = [](auto value, size_t alignment) noexcept { return ((value + alignment - 1) & ~(alignment - 1)); };
+
+    // Fill the build information with the current information, the rest is filled later (scratch buffer and destination AS)
+    VkAccelerationStructureBuildGeometryInfoKHR asBuildInfo{
+        .sType         = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR,
+        .type          = asType,  // The type of acceleration structure (BLAS or TLAS)
+        .flags         = flags,   // Build flags (e.g. prefer fast trace)
+        .mode          = VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR,  // Build mode vs update
+        .geometryCount = 1,                                               // Deal with one geometry at a time
+        .pGeometries   = &asGeometry,  // The geometry to build the acceleration structure from
+    };
+
+    // One geometry at a time (could be multiple)
+    std::vector<uint32_t> maxPrimCount(1);
+    maxPrimCount[0] = asBuildRangeInfo.primitiveCount;
+
+    // Find the size of the acceleration structure and the scratch buffer
+    VkAccelerationStructureBuildSizesInfoKHR asBuildSize{.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_SIZES_INFO_KHR};
+    vkGetAccelerationStructureBuildSizesKHR(device, VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR, &asBuildInfo,
+                                            maxPrimCount.data(), &asBuildSize);
+
+    // Make sure the scratch buffer is properly aligned
+    VkDeviceSize scratchSize = alignUp(asBuildSize.buildScratchSize, m_asProperties.minAccelerationStructureScratchOffsetAlignment);
+
+    // Create the scratch buffer to store the temporary data for the build
+    nvvk::Buffer scratchBuffer;
+    NVVK_CHECK(m_allocator.createBuffer(scratchBuffer, scratchSize,
+                                        VK_BUFFER_USAGE_2_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_2_SHADER_DEVICE_ADDRESS_BIT
+                                            | VK_BUFFER_USAGE_2_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR,
+                                        VMA_MEMORY_USAGE_AUTO, {}, m_asProperties.minAccelerationStructureScratchOffsetAlignment));
+
+    // Create the acceleration structure
+    VkAccelerationStructureCreateInfoKHR createInfo{
+        .sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_CREATE_INFO_KHR,
+        .size  = asBuildSize.accelerationStructureSize,  // The size of the acceleration structure
+        .type  = asType,                                 // The type of acceleration structure (BLAS or TLAS)
+    };
+    NVVK_CHECK(m_allocator.createAcceleration(accelStruct, createInfo));
+
+    // Build the acceleration structure
+    {
+      VkCommandBuffer cmd = m_app->createTempCmdBuffer();
+
+      // Fill with new information for the build,scratch buffer and destination AS
+      asBuildInfo.dstAccelerationStructure  = accelStruct.accel; // WHERE to write final result
+      asBuildInfo.scratchData.deviceAddress = scratchBuffer.address; // WHERE to do calculations
+
+      VkAccelerationStructureBuildRangeInfoKHR* pBuildRangeInfo = &asBuildRangeInfo;
+      vkCmdBuildAccelerationStructuresKHR(cmd, 1, &asBuildInfo, &pBuildRangeInfo); // scratch buffer used for temp storage while building
+
+      m_app->submitAndWaitTempCmdBuffer(cmd);
+    }
+    // Cleanup the scratch buffer
+    m_allocator.destroyBuffer(scratchBuffer);
+  }
+
+  void createBottomLevelAS()
+  {
+    SCOPED_TIMER(__FUNCTION__);
+
+    // Prepare geometry information for all meshes
+    m_blasAccel.resize(m_sceneResource.meshes.size());
+
+    // For now, just log that we're ready to build BLAS
+    LOGI("  Ready to build %zu bottom-level acceleration structures\n", m_sceneResource.meshes.size());
+
+    // TODO: In Phase 3, we'll add the actual building:
+    // For each mesh
+    //   - create acceleration structure geometry from internal mesh primitive (primitiveToGeometry)
+    //   - create acceleration structure
+  }
+    
+  void createTopLevelAS()
+  {
+    SCOPED_TIMER(__FUNCTION__);
+
+    // VkTransformMatrixKHR is row-major 3x4, glm::mat4 is column-major; transpose before memcpy.
+    auto toTransformMatrixKHR = [](const glm::mat4& m) {
+      VkTransformMatrixKHR t;
+      memcpy(&t, glm::value_ptr(glm::transpose(m)), sizeof(t));
+      return t;
+    };
+
+    // Prepare instance data for TLAS
+    std::vector<VkAccelerationStructureInstanceKHR> tlasInstances;
+    tlasInstances.reserve(m_sceneResource.instances.size());
+
+    for(const shaderio::GltfInstance& instance : m_sceneResource.instances)
+    {
+      VkAccelerationStructureInstanceKHR asInstance{};
+      asInstance.transform           = toTransformMatrixKHR(instance.transform);  // Position of the instance
+      asInstance.instanceCustomIndex = instance.meshIndex;                        // gl_InstanceCustomIndexEXT
+      // asInstance.accelerationStructureReference = m_blasAccel[instance.meshIndex].address;  // Will be set in Phase 3
+      asInstance.instanceShaderBindingTableRecordOffset = 0;  // We will use the same hit group for all objects
+      asInstance.flags = VK_GEOMETRY_INSTANCE_TRIANGLE_CULL_DISABLE_BIT_NV;  // No culling - double sided
+      asInstance.mask  = 0xFF;
+      tlasInstances.emplace_back(asInstance);
+    }
+
+    // For now, just log that we're ready to build TLAS
+    LOGI("  Ready to build top-level acceleration structure with %zu instances\n", tlasInstances.size());
+
+    // TODO: In Phase 3, we'll add the actual building:
+    // 1. Create and upload instance buffer
+    // 2. Create TLAS geometry from instances
+    // 3. Call createAccelerationStructure with TLAS type
+  }
+
+
 private:
   // Application and core components
   nvapp::Application*     m_app{};             // The application framework
@@ -836,3 +961,36 @@ int main(int argc, char** argv)
 
   return 0;
 }
+
+/// <summary>
+/// Convert mesh data to acceleration structure geometry
+/// </summary>
+void primitiveToGeometry(const shaderio::GltfMesh& gltfMesh, VkAccelerationStructureGeometryKHR& geometry, VkAccelerationStructureBuildRangeInfoKHR& rangeInfo)
+{
+  const shaderio::TriangleMesh triMesh       = gltfMesh.triMesh;
+  const auto                   triangleCount = static_cast<uint32_t>(triMesh.indices.count / 3U);
+
+  // Describe buffer as array of VertexObj.
+  VkAccelerationStructureGeometryTrianglesDataKHR triangles{
+      .sType        = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_TRIANGLES_DATA_KHR,
+      .vertexFormat = VK_FORMAT_R32G32B32_SFLOAT,  // vec3 vertex position data
+      .vertexData   = {.deviceAddress = VkDeviceAddress(gltfMesh.gltfBuffer) + triMesh.positions.offset},
+      .vertexStride = triMesh.positions.byteStride,
+      .maxVertex    = triMesh.positions.count - 1,
+      .indexType    = VkIndexType(gltfMesh.indexType),  // Index type (VK_INDEX_TYPE_UINT16 or VK_INDEX_TYPE_UINT32)
+      .indexData    = {.deviceAddress = VkDeviceAddress(gltfMesh.gltfBuffer) + triMesh.indices.offset},
+  };
+
+  // Identify the above data as containing opaque triangles.
+  geometry = VkAccelerationStructureGeometryKHR{
+      .sType        = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR,
+      .geometryType = VK_GEOMETRY_TYPE_TRIANGLES_KHR,
+      .geometry     = {.triangles = triangles},
+      .flags        = VK_GEOMETRY_NO_DUPLICATE_ANY_HIT_INVOCATION_BIT_KHR | VK_GEOMETRY_OPAQUE_BIT_KHR,
+  };
+
+  rangeInfo = VkAccelerationStructureBuildRangeInfoKHR{.primitiveCount = triangleCount};
+}
+
+
+
