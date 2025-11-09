@@ -163,6 +163,13 @@ public:
 
     // Initialize the tonemapper also with proe-compiled shader
     m_tonemapper.init(&m_allocator, std::span(tonemapper_slang));
+
+    // Get ray tracing properties
+    VkPhysicalDeviceProperties2 prop2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
+    m_rtProperties.pNext = &m_asProperties;
+    prop2.pNext          = &m_rtProperties;
+    vkGetPhysicalDeviceProperties2(m_app->getPhysicalDevice(), &prop2);
+
   }
 
   //-------------------------------------------------------------------------------
@@ -718,6 +725,27 @@ private:
   nvshaders::Tonemapper    m_tonemapper{};      // Tonemapper for post-processing effects
   shaderio::TonemapperData m_tonemapperData{};  // Tonemapper data used to pass parameters to the tonemapper shader
   glm::vec2 m_metallicRoughnessOverride{-0.01f, -0.01f};  // Override values for metallic and roughness, used in the UI to control the material properties
+
+  // Ray Tracing Pipeline Components
+  nvvk::DescriptorPack m_rtDescPack;          // Ray tracing descriptor bindings
+  VkPipeline           m_rtPipeline{};        // Ray tracing pipeline
+  VkPipelineLayout     m_rtPipelineLayout{};  // Ray tracing pipeline layout
+
+  // Acceleration Structure Components
+  std::vector<nvvk::AccelerationStructure> m_blasAccel;  // Bottom-level acceleration structures
+  nvvk::AccelerationStructure              m_tlasAccel;  // Top-level acceleration structure
+
+  // Direct SBT management
+  nvvk::Buffer                    m_sbtBuffer;         // Buffer for shader binding table
+  std::vector<uint8_t>            m_shaderHandles;     // Storage for shader group handles
+  VkStridedDeviceAddressRegionKHR m_raygenRegion{};    // Ray generation shader region
+  VkStridedDeviceAddressRegionKHR m_missRegion{};      // Miss shader region
+  VkStridedDeviceAddressRegionKHR m_hitRegion{};       // Hit shader region
+  VkStridedDeviceAddressRegionKHR m_callableRegion{};  // Callable shader region
+
+  // Ray Tracing Properties
+  VkPhysicalDeviceRayTracingPipelinePropertiesKHR m_rtProperties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_PIPELINE_PROPERTIES_KHR};
+  VkPhysicalDeviceAccelerationStructurePropertiesKHR m_asProperties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_PROPERTIES_KHR};
 };
 
 
@@ -736,12 +764,18 @@ int main(int argc, char** argv)
 
   // Setting up the Vulkan context, instance and device extensions
   VkPhysicalDeviceShaderObjectFeaturesEXT shaderObjectFeatures{.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_OBJECT_FEATURES_EXT};
+  // ray tracing features
+  VkPhysicalDeviceAccelerationStructureFeaturesKHR accelFeature{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR};
+  VkPhysicalDeviceRayTracingPipelineFeaturesKHR rtPipelineFeature{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_PIPELINE_FEATURES_KHR};
   nvvk::ContextInitInfo vkSetup{
       .instanceExtensions = {VK_EXT_DEBUG_UTILS_EXTENSION_NAME},
       .deviceExtensions =
           {
               {VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME},
               {VK_EXT_SHADER_OBJECT_EXTENSION_NAME, &shaderObjectFeatures},
+              {VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME, &accelFeature},     // Build acceleration structures
+              {VK_KHR_RAY_TRACING_PIPELINE_EXTENSION_NAME, &rtPipelineFeature},  // Use vkCmdTraceRaysKHR
+              {VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME}              // Required by ray tracing pipeline
           },
   };
   if(!appInfo.headless)
