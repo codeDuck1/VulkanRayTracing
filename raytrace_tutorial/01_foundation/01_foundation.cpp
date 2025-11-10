@@ -52,6 +52,7 @@
 #include "_autogen/sky_simple.slang.h"  // from nvpro_core2
 #include "_autogen/tonemapper.slang.h"  //   "    "
 #include "_autogen/foundation.slang.h"  // Local shader
+#include "_autogen/rtbasic.slang.h"     // Local shader
 
 
 #include <nvaftermath/aftermath.hpp>       // Nsight Aftermath for crash tracking and shader debugging
@@ -941,22 +942,72 @@ private:
     SCOPED_TIMER(__FUNCTION__);
     m_allocator.destroyBuffer(m_sbtBuffer);  // Cleanup when re-creating
 
-    // TODO: In Phase 5, we'll populate this with actual shader data
-    // For now, just prepare the infrastructure
+    VkDevice device          = m_app->getDevice();
+    uint32_t handleSize      = m_rtProperties.shaderGroupHandleSize;
+    uint32_t handleAlignment = m_rtProperties.shaderGroupHandleAlignment; // aligned for individual shader group handle sizes
+    uint32_t baseAlignment   = m_rtProperties.shaderGroupBaseAlignment; // alignment for buffer device address where each SBT region starts
+    uint32_t groupCount      = rtPipelineInfo.groupCount;
 
-    // Calculate required SBT buffer size (will be populated in Phase 5)
-    size_t bufferSize = 1024;  // Placeholder size
+    // Get shader group handles
+    // used by GPU to identify which shader to execute for each ray type
+    size_t dataSize = handleSize * groupCount;
+    m_shaderHandles.resize(dataSize);
+    NVVK_CHECK(vkGetRayTracingShaderGroupHandlesKHR(device, m_rtPipeline, 0, groupCount, dataSize, m_shaderHandles.data()));
+
+    // Calculate SBT buffer size with proper alignment
+    auto     alignUp      = [](uint32_t size, uint32_t alignment) { return (size + alignment - 1) & ~(alignment - 1); };
+    uint32_t raygenSize   = alignUp(handleSize, handleAlignment);
+    uint32_t missSize     = alignUp(handleSize, handleAlignment);
+    uint32_t hitSize      = alignUp(handleSize, handleAlignment);
+    uint32_t callableSize = 0;  // No callable shaders in this tutorial
+
+    // Ensure each region starts at a baseAlignment boundary
+    uint32_t raygenOffset   = 0;
+    uint32_t missOffset     = alignUp(raygenSize, baseAlignment);
+    uint32_t hitOffset      = alignUp(missOffset + missSize, baseAlignment);
+    uint32_t callableOffset = alignUp(hitOffset + hitSize, baseAlignment);
+
+    size_t bufferSize = callableOffset + callableSize;
 
     // Create SBT buffer
+    // cpu fast write memory, gpu slower reads. better for frequently updated data vs staging approach
     NVVK_CHECK(m_allocator.createBuffer(m_sbtBuffer, bufferSize, VK_BUFFER_USAGE_2_SHADER_BINDING_TABLE_BIT_KHR, VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
                                         VMA_ALLOCATION_CREATE_MAPPED_BIT | VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT));
     NVVK_DBG_NAME(m_sbtBuffer.buffer);
-    LOGI("Shader binding table buffer created (will be populated in Phase 5)\n");
+
+    // Populate SBT buffer
+    uint8_t* pData = static_cast<uint8_t*>(m_sbtBuffer.mapping); // ptr to cpu-accessible memory of sbt buffer. directly write to it!
+
+    // each shader type gets its own region in SBT buffer, filled below 
+    
+    // Ray generation shader (group 0)
+    memcpy(pData + raygenOffset, // desintation
+        m_shaderHandles.data() + 0 * handleSize, // source (got from vkGetRTGroupHandlesKHR above)
+        handleSize); // size
+    m_raygenRegion.deviceAddress = m_sbtBuffer.address + raygenOffset;
+    m_raygenRegion.stride        = raygenSize;
+    m_raygenRegion.size          = raygenSize;
+
+    // Miss shader (group 1)
+    memcpy(pData + missOffset, m_shaderHandles.data() + 1 * handleSize, handleSize);
+    m_missRegion.deviceAddress = m_sbtBuffer.address + missOffset;
+    m_missRegion.stride        = missSize;
+    m_missRegion.size          = missSize;
+
+    // Hit shader (group 2)
+    memcpy(pData + hitOffset, m_shaderHandles.data() + 2 * handleSize, handleSize);
+    m_hitRegion.deviceAddress = m_sbtBuffer.address + hitOffset;
+    m_hitRegion.stride        = hitSize;
+    m_hitRegion.size          = hitSize;
+
+    // Callable shaders (none in this tutorial)
+    m_callableRegion.deviceAddress = 0;
+    m_callableRegion.stride        = 0;
+    m_callableRegion.size          = 0;
+
+    LOGI("Shader binding table created and populated \n");
   }
 
-  /// <summary>
-  /// access to TLAS and output image produced by ray tracer
-  /// </summary>
   void createRaytraceDescriptorLayout()
   {
     SCOPED_TIMER(__FUNCTION__);
@@ -971,7 +1022,6 @@ private:
                          .stageFlags      = VK_SHADER_STAGE_ALL});
 
     // Creating a PUSH descriptor set and set layout from the bindings
-    // push descriptor sets different from reg in that no alloc from pool, just push updates directly
     m_rtDescPack.init(bindings, m_app->getDevice(), 0, VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR);
 
     LOGI("Ray tracing descriptor layout created\n");
@@ -982,11 +1032,10 @@ private:
     SCOPED_TIMER(__FUNCTION__);
 
     // For re-creation
-    m_allocator.destroyBuffer(m_sbtBuffer);
     vkDestroyPipeline(m_app->getDevice(), m_rtPipeline, nullptr);
     vkDestroyPipelineLayout(m_app->getDevice(), m_rtPipelineLayout, nullptr);
 
-    // Creating all shaders (placeholder for now)
+    // Creating all shaders
     enum StageIndices
     {
       eRaygen,
@@ -998,9 +1047,18 @@ private:
     for(auto& s : stages)
       s.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
 
-    // TODO: In Phase 5, we'll add actual shader compilation
-    // For now, create empty stages to test pipeline creation
-    LOGI("Creating ray tracing pipeline structure (shaders will be added in Phase 5)\n");
+    // Compile shader, fallback to pre-compiled
+    VkShaderModuleCreateInfo shaderCode = compileSlangShader("rtbasic.slang", rtbasic_slang);
+
+    stages[eRaygen].pNext     = &shaderCode;
+    stages[eRaygen].pName     = "rgenMain";
+    stages[eRaygen].stage     = VK_SHADER_STAGE_RAYGEN_BIT_KHR;
+    stages[eMiss].pNext       = &shaderCode;
+    stages[eMiss].pName       = "rmissMain";
+    stages[eMiss].stage       = VK_SHADER_STAGE_MISS_BIT_KHR;
+    stages[eClosestHit].pNext = &shaderCode;
+    stages[eClosestHit].pName = "rchitMain";
+    stages[eClosestHit].stage = VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR;
 
     // Shader groups
     VkRayTracingShaderGroupCreateInfoKHR group{VK_STRUCTURE_TYPE_RAY_TRACING_SHADER_GROUP_CREATE_INFO_KHR};
@@ -1040,17 +1098,23 @@ private:
     vkCreatePipelineLayout(m_app->getDevice(), &pipeline_layout_create_info, nullptr, &m_rtPipelineLayout);
     NVVK_DBG_NAME(m_rtPipelineLayout);
 
+    // Assemble the shader stages and recursion depth info into the ray tracing pipeline
     VkRayTracingPipelineCreateInfoKHR rtPipelineInfo{VK_STRUCTURE_TYPE_RAY_TRACING_PIPELINE_CREATE_INFO_KHR};
+    rtPipelineInfo.stageCount                   = static_cast<uint32_t>(stages.size());
+    rtPipelineInfo.pStages                      = stages.data();
+    rtPipelineInfo.groupCount                   = static_cast<uint32_t>(shader_groups.size());
+    rtPipelineInfo.pGroups                      = shader_groups.data();
+    rtPipelineInfo.maxPipelineRayRecursionDepth = std::max(3U, m_rtProperties.maxRayRecursionDepth);// controls max num of times ray can recurisve call TraceRay
+    rtPipelineInfo.layout                       = m_rtPipelineLayout;
+    vkCreateRayTracingPipelinesKHR(m_app->getDevice(), {}, {}, 1, &rtPipelineInfo, nullptr, &m_rtPipeline);
+    NVVK_DBG_NAME(m_rtPipeline);
 
-    // TODO: In Phase 5, we'll add actual shader stages and create the pipeline
-    // For now, just log that the pipeline layout is ready
-    LOGI("Ray tracing pipeline layout created successfully\n");
+    LOGI("Ray tracing pipeline created successfully\n");
 
     // Create the shader binding table for this pipeline
     createShaderBindingTable(rtPipelineInfo);
   }
 };
-
 
 //---------------------------------------------------------------------------------------------------------------
 // The main function, entry point of the application
