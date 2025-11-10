@@ -180,6 +180,10 @@ public:
     // Set up acceleration structure infrastructure
     createBottomLevelAS();  // Set up BLAS infrastructure
     createTopLevelAS();     // Set up TLAS infrastructure
+
+    // Set up ray tracing pipeline infrastructure
+    createRaytraceDescriptorLayout();  // Create descriptor layout
+    createRayTracingPipeline();        // Create pipeline structure and SBT
   }
 
   //-------------------------------------------------------------------------------
@@ -223,7 +227,14 @@ public:
     }
     m_allocator.destroyAcceleration(m_tlasAccel);
 
+    // Ray tracing components
+    vkDestroyPipelineLayout(device, m_rtPipelineLayout, nullptr);
+    vkDestroyPipeline(device, m_rtPipeline, nullptr);
+    m_rtDescPack.deinit();
+    m_allocator.destroyBuffer(m_sbtBuffer);
+
     m_allocator.deinit();
+
   }
 
   //---------------------------------------------------------------------------------------------------------------
@@ -924,6 +935,120 @@ private:
   // Ray Tracing Properties
   VkPhysicalDeviceRayTracingPipelinePropertiesKHR m_rtProperties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_PIPELINE_PROPERTIES_KHR};
   VkPhysicalDeviceAccelerationStructurePropertiesKHR m_asProperties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_PROPERTIES_KHR};
+
+  void createShaderBindingTable(const VkRayTracingPipelineCreateInfoKHR& rtPipelineInfo)
+  {
+    SCOPED_TIMER(__FUNCTION__);
+    m_allocator.destroyBuffer(m_sbtBuffer);  // Cleanup when re-creating
+
+    // TODO: In Phase 5, we'll populate this with actual shader data
+    // For now, just prepare the infrastructure
+
+    // Calculate required SBT buffer size (will be populated in Phase 5)
+    size_t bufferSize = 1024;  // Placeholder size
+
+    // Create SBT buffer
+    NVVK_CHECK(m_allocator.createBuffer(m_sbtBuffer, bufferSize, VK_BUFFER_USAGE_2_SHADER_BINDING_TABLE_BIT_KHR, VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
+                                        VMA_ALLOCATION_CREATE_MAPPED_BIT | VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT));
+    NVVK_DBG_NAME(m_sbtBuffer.buffer);
+    LOGI("Shader binding table buffer created (will be populated in Phase 5)\n");
+  }
+
+  /// <summary>
+  /// access to TLAS and output image produced by ray tracer
+  /// </summary>
+  void createRaytraceDescriptorLayout()
+  {
+    SCOPED_TIMER(__FUNCTION__);
+    nvvk::DescriptorBindings bindings;
+    bindings.addBinding({.binding         = shaderio::BindingPoints::eTlas,
+                         .descriptorType  = VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR,
+                         .descriptorCount = 1,
+                         .stageFlags      = VK_SHADER_STAGE_ALL});
+    bindings.addBinding({.binding         = shaderio::BindingPoints::eOutImage,
+                         .descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+                         .descriptorCount = 1,
+                         .stageFlags      = VK_SHADER_STAGE_ALL});
+
+    // Creating a PUSH descriptor set and set layout from the bindings
+    // push descriptor sets different from reg in that no alloc from pool, just push updates directly
+    m_rtDescPack.init(bindings, m_app->getDevice(), 0, VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR);
+
+    LOGI("Ray tracing descriptor layout created\n");
+  }
+
+  void createRayTracingPipeline()
+  {
+    SCOPED_TIMER(__FUNCTION__);
+
+    // For re-creation
+    m_allocator.destroyBuffer(m_sbtBuffer);
+    vkDestroyPipeline(m_app->getDevice(), m_rtPipeline, nullptr);
+    vkDestroyPipelineLayout(m_app->getDevice(), m_rtPipelineLayout, nullptr);
+
+    // Creating all shaders (placeholder for now)
+    enum StageIndices
+    {
+      eRaygen,
+      eMiss,
+      eClosestHit,
+      eShaderGroupCount
+    };
+    std::array<VkPipelineShaderStageCreateInfo, eShaderGroupCount> stages{};
+    for(auto& s : stages)
+      s.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+
+    // TODO: In Phase 5, we'll add actual shader compilation
+    // For now, create empty stages to test pipeline creation
+    LOGI("Creating ray tracing pipeline structure (shaders will be added in Phase 5)\n");
+
+    // Shader groups
+    VkRayTracingShaderGroupCreateInfoKHR group{VK_STRUCTURE_TYPE_RAY_TRACING_SHADER_GROUP_CREATE_INFO_KHR};
+    group.anyHitShader       = VK_SHADER_UNUSED_KHR;
+    group.closestHitShader   = VK_SHADER_UNUSED_KHR;
+    group.generalShader      = VK_SHADER_UNUSED_KHR;
+    group.intersectionShader = VK_SHADER_UNUSED_KHR;
+
+    std::vector<VkRayTracingShaderGroupCreateInfoKHR> shader_groups;
+    // Raygen
+    group.type          = VK_RAY_TRACING_SHADER_GROUP_TYPE_GENERAL_KHR;
+    group.generalShader = eRaygen;
+    shader_groups.push_back(group);
+
+    // Miss
+    group.type          = VK_RAY_TRACING_SHADER_GROUP_TYPE_GENERAL_KHR;
+    group.generalShader = eMiss;
+    shader_groups.push_back(group);
+
+    // closest hit shader
+    group.type             = VK_RAY_TRACING_SHADER_GROUP_TYPE_TRIANGLES_HIT_GROUP_KHR;
+    group.generalShader    = VK_SHADER_UNUSED_KHR;
+    group.closestHitShader = eClosestHit;
+    shader_groups.push_back(group);
+
+    // Push constant: we want to be able to update constants used by the shaders
+    const VkPushConstantRange push_constant{VK_SHADER_STAGE_ALL, 0, sizeof(shaderio::TutoPushConstant)};
+
+    VkPipelineLayoutCreateInfo pipeline_layout_create_info{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    pipeline_layout_create_info.pushConstantRangeCount = 1;
+    pipeline_layout_create_info.pPushConstantRanges    = &push_constant;
+
+    // Descriptor sets: one specific to ray tracing, and one shared with the rasterization pipeline
+    std::array<VkDescriptorSetLayout, 2> layouts = {m_descPack.getLayout(), m_rtDescPack.getLayout()};
+    pipeline_layout_create_info.setLayoutCount   = uint32_t(layouts.size());
+    pipeline_layout_create_info.pSetLayouts      = layouts.data();
+    vkCreatePipelineLayout(m_app->getDevice(), &pipeline_layout_create_info, nullptr, &m_rtPipelineLayout);
+    NVVK_DBG_NAME(m_rtPipelineLayout);
+
+    VkRayTracingPipelineCreateInfoKHR rtPipelineInfo{VK_STRUCTURE_TYPE_RAY_TRACING_PIPELINE_CREATE_INFO_KHR};
+
+    // TODO: In Phase 5, we'll add actual shader stages and create the pipeline
+    // For now, just log that the pipeline layout is ready
+    LOGI("Ray tracing pipeline layout created successfully\n");
+
+    // Create the shader binding table for this pipeline
+    createShaderBindingTable(rtPipelineInfo);
+  }
 };
 
 
