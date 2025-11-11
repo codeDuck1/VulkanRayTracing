@@ -21,7 +21,7 @@ struct HitPayload
 {
     float3 color;   // Accumulated color along the ray path
     float  weight;  // Weight/importance of this ray (for importance sampling)
-    int    depth;   // Current recursion depth (for limiting bounces)
+    int    depth;   // Current recursion depth (for limiting bounces). BOUNCE COUNT!
 };
 
 __generic<T : IFloat> T getAttribute(uint8_t* dataBufferAddress, BufferView bufferView, uint attributeIndex)
@@ -57,6 +57,72 @@ __generic<T : IFloat> T getTriangleAttribute(uint8_t* dataBufferAddress, BufferV
   T attr1 = getAttribute<T>(dataBufferAddress, bufferView, attributeIndex.y);
   T attr2 = getAttribute<T>(dataBufferAddress, bufferView, attributeIndex.z);
   return T(barycentrics.x) * attr0 + T(barycentrics.y) * attr1 + T(barycentrics.z) * attr2;
+}
+
+//-----------------------------------------------------------------------
+// SHADOW TESTING
+//-----------------------------------------------------------------------
+float testShadow(float3 worldPos, float3 worldNormal, float3 lightDirection, GltfPunctual light)
+{
+  RayDesc shadowRay;
+  shadowRay.Origin    = worldPos + worldNormal * 0.001;  // Offset to avoid self-intersection
+  shadowRay.Direction = normalize(lightDirection); // ray was shot from camera, now go in light direction and see if hit anything.
+  shadowRay.TMin      = 0.001;
+  // end point to test for intersections. for direct lights, shadow ray length limited to dist to the light source
+  shadowRay.TMax      = light.type == GltfLightType::eDirectional ? INFINITE : length(lightDirection); 
+
+  // Create a simple payload for shadow ray
+  HitPayload shadowPayload;
+  shadowPayload.depth = 0;
+
+  // Trace the shadow ray with optimized flags
+  TraceRay(topLevelAS, RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_SKIP_CLOSEST_HIT_SHADER, 0xff, 0, 0, 0,
+           shadowRay, shadowPayload);
+
+  // If the shadow ray hit something, the light is occluded
+  // we know hit something is depth of ray is not miss depth
+  // which is set for rays that miss
+  return shadowPayload.depth != MISS_DEPTH ? 0.0 : 1.0;
+}
+
+//-----------------------------------------------------------------------
+// Handles sky override, point light distance attenuation, and spot light cone attenuation
+//-----------------------------------------------------------------------
+GltfPunctual processLight(GltfSceneInfo sceneInfo, float3 worldPos)
+{
+  GltfPunctual light = sceneInfo.punctualLights[0];  // Using the first light for simplicity
+
+  // Sky override: replace punctual light with sun parameters
+  if(sceneInfo.useSky == 1)
+  {
+    light.direction = sceneInfo.skySimpleParam.sunDirection;
+    light.color     = sceneInfo.skySimpleParam.sunColor;
+    light.intensity = sceneInfo.skySimpleParam.sunIntensity;
+    light.type      = GltfLightType::eDirectional;
+  }
+
+  // Point light: calculate direction and apply distance attenuation
+  if(light.type == GltfLightType::ePoint)
+  {
+    light.direction = light.position - worldPos;
+    float d         = length(light.direction);
+    light.intensity /= (d * d);  // Inverse square law
+  }
+  // Spot light: calculate direction, apply distance and cone attenuation
+  else if(light.type == GltfLightType::eSpot)
+  {
+    float3 lightDir = light.position - worldPos;
+    float  d        = length(lightDir);
+    light.intensity /= (d * d);  // Distance attenuation
+    
+    // Cone attenuation
+    float theta         = dot(normalize(lightDir), normalize(light.direction));
+    float spotIntensity = clamp((theta - cos(light.coneAngle)) / (1.0 - cos(light.coneAngle)), 0.0, 1.0);
+    light.intensity *= spotIntensity;
+    light.direction = lightDir;
+  }
+
+  return light;
 }
 
 // Ray generation shader - entry point for each pixel
@@ -142,13 +208,20 @@ void rchitMain(inout HitPayload payload, in BuiltInTriangleIntersectionAttribute
     float metallic = material.metallicFactor;
     float roughness = material.roughnessFactor;
     
+    // Process light with sky override and distance attenuation
+    GltfPunctual light = processLight(sceneInfo, worldPos);
+
     float3 N = normalize(worldNormal);
     float3 V = -WorldRayDirection();
-    float3 L = normalize(sceneInfo.punctualLights[0].direction);
-    
+    float3 L = normalize(light.direction);
+
+    // Test for shadows
+    float shadowFactor = testShadow(worldPos, N, light.direction, light);
+
+    // Calculate PBR lighting with shadow factor
     float3 color = pbrMetallicRoughness(albedo, metallic, roughness, N, V, L);
-    color *= sceneInfo.punctualLights[0].color * sceneInfo.punctualLights[0].intensity;
-    
+    color *= light.color * light.intensity * shadowFactor;
+
     payload.color = color;
 }
 
@@ -173,5 +246,5 @@ void rmissMain(inout HitPayload payload)
         payload.color += sceneInfo.backgroundColor * payload.weight;
     }
     
-    payload.depth = MISS_DEPTH;
+    payload.depth = MISS_DEPTH; // if didnt hit anything, set payload depth for this ray as our defined miss depth
 }
