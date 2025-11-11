@@ -1,6 +1,9 @@
 #include "shaderio.h"
-
+#include "common/shaders/pbr.h.slang"
 #include "nvshaders/constants.h.slang"
+#include "nvshaders/sky_functions.h.slang"
+
+#define MISS_DEPTH 1000
 
 // clang-format off
 // Push constants containing scene information and camera data
@@ -20,6 +23,41 @@ struct HitPayload
     float  weight;  // Weight/importance of this ray (for importance sampling)
     int    depth;   // Current recursion depth (for limiting bounces)
 };
+
+__generic<T : IFloat> T getAttribute(uint8_t* dataBufferAddress, BufferView bufferView, uint attributeIndex)
+{
+  if(bufferView.count > 0)
+  {
+    T* ptr = (T*)(dataBufferAddress + bufferView.offset + attributeIndex * bufferView.byteStride);
+    return ptr[0];
+  }
+
+  return T(1);  // Error case
+}
+
+int3 getTriangleIndices(uint8_t* dataBufferAddress, const TriangleMesh mesh, int primitiveID)
+{
+  if(mesh.indices.byteStride == sizeof(int16_t))
+  {
+    int16_t3* indices = (int16_t3*)(dataBufferAddress + mesh.indices.offset);
+    return indices[primitiveID];
+  }
+  else if(mesh.indices.byteStride == sizeof(int32_t))
+  {
+    int3* indices = (int3*)(dataBufferAddress + mesh.indices.offset);
+    return indices[primitiveID];
+  }
+
+  return int3(-1);  // Error case
+}
+
+__generic<T : IFloat> T getTriangleAttribute(uint8_t* dataBufferAddress, BufferView bufferView, uint3 attributeIndex, float3 barycentrics)
+{
+  T attr0 = getAttribute<T>(dataBufferAddress, bufferView, attributeIndex.x);
+  T attr1 = getAttribute<T>(dataBufferAddress, bufferView, attributeIndex.y);
+  T attr2 = getAttribute<T>(dataBufferAddress, bufferView, attributeIndex.z);
+  return T(barycentrics.x) * attr0 + T(barycentrics.y) * attr1 + T(barycentrics.z) * attr2;
+}
 
 // Ray generation shader - entry point for each pixel
 [shader("raygeneration")]
@@ -77,7 +115,41 @@ void rchitMain(inout HitPayload payload, in BuiltInTriangleIntersectionAttribute
     // 1. Sample material properties (albedo, normal, etc.)
     // 2. Calculate lighting (direct + indirect)
     // 3. Potentially cast secondary rays (reflection, refraction)
-    payload.color = float3(1, 0, 0); // Red color
+
+    // Get barycentric coordinates (pts position in triangle using weights based on tris 3 vertices)
+    float3 barycentrics = float3(1 - attr.barycentrics.x - attr.barycentrics.y, attr.barycentrics.x, attr.barycentrics.y);
+    
+    // Get instance and primitive information
+    // raw functions automatically available in rt shaders!
+    uint instanceID = InstanceIndex();
+    uint meshID = InstanceID(); // corresponds to mesh index for each instance
+    uint triID = PrimitiveIndex();
+
+    GltfSceneInfo sceneInfo = pushConst.sceneInfoAddress[0];
+    GltfInstance instance = sceneInfo.instances[instanceID];
+    GltfMesh mesh = sceneInfo.meshes[instance.meshIndex];
+    GltfMetallicRoughness material = sceneInfo.materials[instance.materialIndex];
+
+    // Get world position and normal
+    int3 indices = getTriangleIndices(mesh.gltfBuffer, mesh.triMesh, triID);
+    float3 pos = getTriangleAttribute<float3>(mesh.gltfBuffer, mesh.triMesh.positions, indices, barycentrics);
+    float3 nrm = getTriangleAttribute<float3>(mesh.gltfBuffer, mesh.triMesh.normals, indices, barycentrics);
+    float3 worldPos = float3(mul(float4(pos, 1.0), ObjectToWorld4x3()));
+    float3 worldNormal = normalize(mul(WorldToObject4x3(), nrm).xyz);
+
+    // Simple PBR shading
+    float3 albedo = material.baseColorFactor.xyz;
+    float metallic = material.metallicFactor;
+    float roughness = material.roughnessFactor;
+    
+    float3 N = normalize(worldNormal);
+    float3 V = -WorldRayDirection();
+    float3 L = normalize(sceneInfo.punctualLights[0].direction);
+    
+    float3 color = pbrMetallicRoughness(albedo, metallic, roughness, N, V, L);
+    color *= sceneInfo.punctualLights[0].color * sceneInfo.punctualLights[0].intensity;
+    
+    payload.color = color;
 }
 
 // Miss shader - called when ray doesn't hit any geometry
@@ -89,5 +161,17 @@ void rmissMain(inout HitPayload payload)
     // - Skybox textures
     // - Procedural sky gradients
     // - Environment maps
-    payload.color = float3(0.5, 0.5, 0.5); // Gray background
+    GltfSceneInfo sceneInfo = pushConst.sceneInfoAddress[0];
+    
+    if(sceneInfo.useSky == 1)
+    {
+        float3 skyColor = evalSimpleSky(sceneInfo.skySimpleParam, WorldRayDirection());
+        payload.color += skyColor * payload.weight;
+    }
+    else
+    {
+        payload.color += sceneInfo.backgroundColor * payload.weight;
+    }
+    
+    payload.depth = MISS_DEPTH;
 }
