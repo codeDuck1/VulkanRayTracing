@@ -5,6 +5,9 @@
 
 #define MISS_DEPTH 1000
 
+//define REFLECTION_RECURSIVE  // Hardware recursion approach
+#define REFLECTION_ITERATIVE    // Loop-based approach
+
 // clang-format off
 // Push constants containing scene information and camera data
 [[vk::push_constant]]                           ConstantBuffer<TutoPushConstant> pushConst;
@@ -20,8 +23,12 @@
 struct HitPayload
 {
     float3 color;   // Accumulated color along the ray path
-    float  weight;  // Weight/importance of this ray (for importance sampling)
-    int    depth;   // Current recursion depth (for limiting bounces). BOUNCE COUNT!
+    float  weight;  // Reflection weight (decreases with each bounce)
+    int    depth;   // Current reflection depth (for limiting bounces). BOUNCE COUNT!
+
+    // for iterative reflection
+    float3 rayOrigin;
+    float3 rayDirection;
 };
 
 __generic<T : IFloat> T getAttribute(uint8_t* dataBufferAddress, BufferView bufferView, uint attributeIndex)
@@ -161,12 +168,28 @@ void rgenMain()
     payload.weight = 1;               // Full weight for primary rays
     payload.depth = 0;                // Start at depth 0
 
-    // Cast the ray into the scene using the acceleration structure
-    // Parameters: AS, flags, instance mask, sbt offset, sbt stride, miss offset, ray, payload
+#ifdef REFLECTION_ITERATIVE
+  float3 accumulatedColor = float3(0, 0, 0);
+
+  // Iterative reflection loop
+  while(payload.depth < pushConst.depthMax && payload.weight > 0.01)
+  {
+    float prevWeight = payload.weight;
     TraceRay(topLevelAS, rayFlags, 0xff, 0, 0, 0, ray, payload);
-    
-    // Get the final color from the ray tracing result
-    float3 color = payload.color;
+
+    accumulatedColor += payload.color * prevWeight;
+
+    // Update ray for next iteration if continuing
+    ray.Origin    = payload.rayOrigin;
+    ray.Direction = payload.rayDirection;
+  }
+
+  float3 color = accumulatedColor;
+#else
+  // Recursive reflection (handled in closest hit shader)
+  TraceRay(topLevelAS, rayFlags, 0xff, 0, 0, 0, ray, payload);
+  float3 color = payload.color;
+#endif
     
     // Write the result to the output image
     outImage[int2(launchID)] = float4(color, 1.0);
@@ -222,7 +245,47 @@ void rchitMain(inout HitPayload payload, in BuiltInTriangleIntersectionAttribute
     float3 color = pbrMetallicRoughness(albedo, metallic, roughness, N, V, L);
     color *= light.color * light.intensity * shadowFactor;
 
-    payload.color = color;
+  // Handle reflection based on material properties
+  float3 reflectionColor = float3(0, 0, 0);
+
+#ifdef REFLECTION_RECURSIVE
+  // Recursive reflection
+  if(payload.depth < pushConst.depthMax && metallic > 0.01)
+  {
+    // Calculate reflection direction
+    float3 reflectionDir = reflect(-V, N);
+
+    // Create reflection ray
+    RayDesc reflectionRay;
+    reflectionRay.Origin    = worldPos + N * 0.001;  // Offset to avoid self-intersection
+    reflectionRay.Direction = reflectionDir;
+    reflectionRay.TMin      = 0.001;
+    reflectionRay.TMax      = INFINITE;
+
+    // Create payload for reflection ray
+    HitPayload reflectionPayload;
+    reflectionPayload.color  = float3(0, 0, 0);
+    reflectionPayload.weight = payload.weight * metallic;
+    reflectionPayload.depth  = payload.depth + 1;
+
+    // Trace reflection ray
+    TraceRay(topLevelAS, 0, 0xff, 0, 0, 0, reflectionRay, reflectionPayload);
+
+    // Add reflection contribution
+    reflectionColor = reflectionPayload.color * metallic;
+  }
+
+  payload.color = color + reflectionColor;
+
+#else
+  // Iterative reflection - set up next iteration
+  payload.rayOrigin    = worldPos;        // + N * 0.001;
+  payload.rayDirection = reflect(-V, N);  // Calculate reflection direction
+  payload.color        = color;
+  payload.weight *= metallic;
+  payload.depth++;
+#endif
+
 }
 
 // Miss shader - called when ray doesn't hit any geometry

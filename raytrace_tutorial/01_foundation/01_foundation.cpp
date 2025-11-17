@@ -83,6 +83,7 @@
 #include "common/utils.hpp"       // Common utilities for the sample application
 #include "common/path_utils.hpp"  // Path utilities for handling resources file paths
 
+#define MAX_DEPTH 10U
 
 /// <summary>
 /// Convert mesh data to acceleration structure geometry
@@ -255,6 +256,14 @@ public:
     if(ImGui::Begin("Settings"))
     {
       ImGui::Checkbox("Use Ray Tracing", &m_useRayTracing);
+
+      ImGui::SeparatorText("Reflection");
+      {
+        PE::begin();
+        PE::SliderInt("Reflection Depth", &m_pushValues.depthMax, 1, MAX_DEPTH, "%d", ImGuiSliderFlags_AlwaysClamp,
+                      "Maximum reflection depth");
+        PE::end();
+      }
 
       if(ImGui::CollapsingHeader("Camera"))
         nvgui::CameraWidget(m_cameraManip);
@@ -962,6 +971,8 @@ private:
   // Ray tracing toggle
   bool m_useRayTracing = true;  // Set to true to use ray tracing, false for rasterization
 
+  shaderio::TutoPushConstant m_pushValues{};  // Push constant values used to pass data to the shaders
+
   void createShaderBindingTable(const VkRayTracingPipelineCreateInfoKHR& rtPipelineInfo)
   {
     SCOPED_TIMER(__FUNCTION__);
@@ -1130,6 +1141,7 @@ private:
     rtPipelineInfo.groupCount                   = static_cast<uint32_t>(shader_groups.size());
     rtPipelineInfo.pGroups                      = shader_groups.data();
     rtPipelineInfo.maxPipelineRayRecursionDepth = std::max(3U, m_rtProperties.maxRayRecursionDepth);// controls max num of times ray can recurisve call TraceRay
+    rtPipelineInfo.maxPipelineRayRecursionDepth = std::max(MAX_DEPTH, m_rtProperties.maxRayRecursionDepth);  // Ray depth
     rtPipelineInfo.layout                       = m_rtPipelineLayout;
     vkCreateRayTracingPipelinesKHR(m_app->getDevice(), {}, {}, 1, &rtPipelineInfo, nullptr, &m_rtPipeline);
     NVVK_DBG_NAME(m_rtPipeline);
@@ -1166,6 +1178,7 @@ private:
     // Push constant information
     shaderio::TutoPushConstant pushValues{
         .sceneInfoAddress = (shaderio::GltfSceneInfo*)m_sceneResource.bSceneInfo.address,
+        .depthMax = m_pushValues.depthMax
     };
     const VkPushConstantsInfo pushInfo{.sType      = VK_STRUCTURE_TYPE_PUSH_CONSTANTS_INFO,
                                        .layout     = m_rtPipelineLayout,

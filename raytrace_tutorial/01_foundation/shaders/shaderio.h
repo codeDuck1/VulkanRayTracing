@@ -39,6 +39,8 @@ struct TutoPushConstant
   int            instanceIndex;              // Instance index for the current draw call
   GltfSceneInfo* sceneInfoAddress;           // Address of the scene information buffer
   float2         metallicRoughnessOverride;  // Metallic and roughness override values
+
+  int depthMax = 3; // maximum reflection depth
 };
 
 NAMESPACE_SHADERIO_END()
