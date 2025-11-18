@@ -5,7 +5,7 @@
 
 #define MISS_DEPTH 1000
 
-//define REFLECTION_RECURSIVE  // Hardware recursion approach
+//#define REFLECTION_RECURSIVE  // Hardware recursion approach
 #define REFLECTION_ITERATIVE    // Loop-based approach
 
 // clang-format off
@@ -30,6 +30,13 @@ struct HitPayload
     float3 rayOrigin;
     float3 rayDirection;
 };
+
+// Minimal payload for shadow rays - only what we need for shadow testing
+struct ShadowPayload
+{
+  int depth;  // Only need to know if we hit something or not
+};
+
 
 __generic<T : IFloat> T getAttribute(uint8_t* dataBufferAddress, BufferView bufferView, uint attributeIndex)
 {
@@ -79,11 +86,11 @@ float testShadow(float3 worldPos, float3 worldNormal, float3 lightDirection, Glt
   shadowRay.TMax      = light.type == GltfLightType::eDirectional ? INFINITE : length(lightDirection); 
 
   // Create a simple payload for shadow ray
-  HitPayload shadowPayload;
+  ShadowPayload shadowPayload;
   shadowPayload.depth = 0;
 
-  // Trace the shadow ray with optimized flags
-  TraceRay(topLevelAS, RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_SKIP_CLOSEST_HIT_SHADER, 0xff, 0, 0, 0,
+  // Trace the shadow ray using the dedicated shadow miss shader (group 1)
+  TraceRay(topLevelAS, RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_SKIP_CLOSEST_HIT_SHADER, 0xff, 0, 0, 1,
            shadowRay, shadowPayload);
 
   // If the shadow ray hit something, the light is occluded
@@ -310,4 +317,11 @@ void rmissMain(inout HitPayload payload)
     }
     
     payload.depth = MISS_DEPTH; // if didnt hit anything, set payload depth for this ray as our defined miss depth
+}
+
+[shader("miss")]
+void rmissShadowMain(inout ShadowPayload payload)
+{
+  // Simple shadow miss shader - no complex lighting calculations
+  payload.depth = MISS_DEPTH;
 }

@@ -83,7 +83,7 @@
 #include "common/utils.hpp"       // Common utilities for the sample application
 #include "common/path_utils.hpp"  // Path utilities for handling resources file paths
 
-#define MAX_DEPTH 10U
+#define MAX_DEPTH 30U
 
 /// <summary>
 /// Convert mesh data to acceleration structure geometry
@@ -398,74 +398,51 @@ public:
   {
     SCOPED_TIMER(__FUNCTION__);
 
-    VkCommandBuffer cmd = m_app->createTempCmdBuffer();
+    VkCommandBuffer cmd              = m_app->createTempCmdBuffer();
+    m_sceneResource.sceneInfo.useSky = true;  // Use sky for lighting
 
     // Load the GLTF resources
     {
-      tinygltf::Model teapotModel =
-          nvsamples::loadGltfResources(nvutils::findFile("teapot.gltf", nvsamples::getResourcesDirs()));  // Load the GLTF resources from the file
+      tinygltf::Model wusonModel =
+          nvsamples::loadGltfResources(nvutils::findFile("wuson.glb", nvsamples::getResourcesDirs()));  // Load the GLTF resources from the file
 
       tinygltf::Model planeModel =
           nvsamples::loadGltfResources(nvutils::findFile("plane.gltf", nvsamples::getResourcesDirs()));  // Load the GLTF resources from the file
 
-      // Textures
-      {
-        std::filesystem::path imageFilename = nvutils::findFile("tiled_floor.png", nvsamples::getResourcesDirs());
-        nvvk::Image texture = nvsamples::loadAndCreateImage(cmd, m_stagingUploader, m_app->getDevice(), imageFilename);  // Load the image from the file and create a texture from it
-        NVVK_DBG_NAME(texture.image);
-        m_samplerPool.acquireSampler(texture.descriptor.sampler);
-        m_textures.emplace_back(texture);  // Store the texture in the vector of textures
-      }
-
-      // Upload the GLTF resources to the GPU
-      {
-        nvsamples::importGltfData(m_sceneResource, teapotModel, m_stagingUploader);  // Import the GLTF resources
-        nvsamples::importGltfData(m_sceneResource, planeModel, m_stagingUploader);   // Import the GLTF resources
-      }
+      // Import and create the glTF data buffer
+      nvsamples::importGltfData(m_sceneResource, wusonModel, m_stagingUploader, false);
+      nvsamples::importGltfData(m_sceneResource, planeModel, m_stagingUploader, false);
     }
 
-
+    // Create materials
     m_sceneResource.materials = {
-        // Teapot material
-        {.baseColorFactor = glm::vec4(0.8f, 1.0f, 0.6f, 1.0f), .metallicFactor = 0.5f, .roughnessFactor = 0.5f},
-        // Plane material with texture
-        {.baseColorFactor = glm::vec4(1.0f, 1.0f, 1.0f, 1.0f), .metallicFactor = 0.1f, .roughnessFactor = 0.8f, .baseColorTextureIndex = 0}};
-
-
-    m_sceneResource.instances = {
-        // Teapot
-        {.transform     = glm::translate(glm::mat4(1), glm::vec3(0, 0, 0)) * glm::scale(glm::mat4(1), glm::vec3(0.5f)),
-         .materialIndex = 0,
-         .meshIndex     = 0},
-        // Plane
-        {.transform = glm::scale(glm::translate(glm::mat4(1), glm::vec3(0, -0.9f, 0)), glm::vec3(2.f)), .materialIndex = 1, .meshIndex = 1},
+        {.baseColorFactor = glm::vec4(0.8f, 1.0f, 0.6f, 1.0f), .metallicFactor = 0.5f, .roughnessFactor = 0.5f},  // Bronze
+        {.baseColorFactor = glm::vec4(.7f, .17f, .17f, 1.0f), .metallicFactor = 0.1f, .roughnessFactor = 0.1f},  // Grey
+        {.baseColorFactor = glm::vec4(0.8f, 0.8f, 1.0f, 1.0f), .metallicFactor = 0.99f, .roughnessFactor = 0.01f},  // Mirror
     };
 
+    m_sceneResource.instances = {
+        // Wuson
+        {.transform = glm::mat4(1.f), .materialIndex = 0, .meshIndex = 0},
+        {.transform = glm::scale(glm::translate(glm::mat4(1), glm::vec3(0, 0, 0)), glm::vec3(2.f)), .materialIndex = 1, .meshIndex = 1},  // Plane
+        // Left mirror
+        {.transform = glm::rotate(glm::translate(glm::mat4(1), glm::vec3(-1.5f, 0, 0)), glm::radians(-90.0f), glm::vec3(0, 0, 1)),
+         .materialIndex = 2,
+         .meshIndex     = 1},
+        // Right mirror
+        {.transform = glm::rotate(glm::translate(glm::mat4(1), glm::vec3(1.5f, 0, 0)), glm::radians(90.0f), glm::vec3(0, 0, 1)),
+         .materialIndex = 2,
+         .meshIndex     = 1},
+    };
 
-    nvsamples::createGltfSceneInfoBuffer(m_sceneResource, m_stagingUploader);  // Create buffers for the scene data (GPU buffers)
+    // Create buffers for the scene data (GPU buffers)
+    nvsamples::createGltfSceneInfoBuffer(m_sceneResource, m_stagingUploader);
 
-    m_stagingUploader.cmdUploadAppended(cmd);  // Upload the scene information to the GPU
+    m_stagingUploader.cmdUploadAppended(cmd);  // Upload the resources
+    m_app->submitAndWaitTempCmdBuffer(cmd);    // Submit the command buffer to upload the resources
 
-    // Scene information
-    shaderio::GltfSceneInfo& sceneInfo = m_sceneResource.sceneInfo;
-    sceneInfo.useSky                   = false;                                         // Use light
-    sceneInfo.instances = (shaderio::GltfInstance*)m_sceneResource.bInstances.address;  // Address of the instance buffer
-    sceneInfo.meshes = (shaderio::GltfMesh*)m_sceneResource.bMeshes.address;            // Address of the mesh buffer
-    sceneInfo.materials = (shaderio::GltfMetallicRoughness*)m_sceneResource.bMaterials.address;  // Address of the material buffer
-    sceneInfo.backgroundColor             = {0.85f, 0.85f, 0.85f};                               // The background color
-    sceneInfo.numLights                   = 1;
-    sceneInfo.punctualLights[0].color     = glm::vec3(1.0f, 1.0f, 1.0f);
-    sceneInfo.punctualLights[0].intensity = 4.0f;
-    sceneInfo.punctualLights[0].position  = glm::vec3(1.0f, 1.0f, 1.0f);  // Position of the light
-    sceneInfo.punctualLights[0].direction = glm::vec3(1.0f, 1.0f, 1.0f);  // Direction to the light
-    sceneInfo.punctualLights[0].type      = shaderio::GltfLightType::ePoint;
-    sceneInfo.punctualLights[0].coneAngle = 0.9f;  // Cone angle for spot lights (0 for point and directional lights)
-
-    m_app->submitAndWaitTempCmdBuffer(cmd);  // Submit the command buffer to upload the resources
-
-    // Default camera
-    m_cameraManip->setClipPlanes({0.01F, 100.0F});
-    m_cameraManip->setLookat({0.0F, 0.5F, 5.0}, {0.F, 0.F, 0.F}, {0.0F, 1.0F, 0.0F});
+    // Set up camera
+    m_cameraManip->setLookat({1.03534, 1.19964, -2.07709}, {-0.05626, 0.81966, -1.40429}, {0.00000, 1.00000, 0.00000});
   }
 
 
@@ -979,7 +956,7 @@ private:
     m_allocator.destroyBuffer(m_sbtBuffer);  // Cleanup when re-creating
 
     VkDevice device          = m_app->getDevice();
-    uint32_t handleSize      = m_rtProperties.shaderGroupHandleSize;
+    uint32_t handleSize      = m_rtProperties.shaderGroupHandleSize; 
     uint32_t handleAlignment = m_rtProperties.shaderGroupHandleAlignment; // aligned for individual shader group handle sizes
     uint32_t baseAlignment   = m_rtProperties.shaderGroupBaseAlignment; // alignment for buffer device address where each SBT region starts
     uint32_t groupCount      = rtPipelineInfo.groupCount;
@@ -993,7 +970,7 @@ private:
     // Calculate SBT buffer size with proper alignment
     auto     alignUp      = [](uint32_t size, uint32_t alignment) { return (size + alignment - 1) & ~(alignment - 1); };
     uint32_t raygenSize   = alignUp(handleSize, handleAlignment);
-    uint32_t missSize     = alignUp(handleSize, handleAlignment);
+    uint32_t missSize     = alignUp(handleSize * 2, handleAlignment);
     uint32_t hitSize      = alignUp(handleSize, handleAlignment);
     uint32_t callableSize = 0;  // No callable shaders in this tutorial
 
@@ -1024,14 +1001,16 @@ private:
     m_raygenRegion.stride        = raygenSize;
     m_raygenRegion.size          = raygenSize;
 
-    // Miss shader (group 1)
-    memcpy(pData + missOffset, m_shaderHandles.data() + 1 * handleSize, handleSize);
+    // Miss shaders (groups 1 and 2) - BOTH primary and shadow miss
+    memcpy(pData + missOffset, m_shaderHandles.data() + 1 * handleSize, handleSize);  // Primary miss
+    memcpy(pData + missOffset + alignUp(handleSize, handleAlignment),                 // Shadow miss
+           m_shaderHandles.data() + 2 * handleSize, handleSize);
     m_missRegion.deviceAddress = m_sbtBuffer.address + missOffset;
-    m_missRegion.stride        = missSize;
-    m_missRegion.size          = missSize;
+    m_missRegion.stride        = alignUp(handleSize, handleAlignment);  // Stride between miss shaders
+    m_missRegion.size          = missSize;                              // Total size for both
 
-    // Hit shader (group 2)
-    memcpy(pData + hitOffset, m_shaderHandles.data() + 2 * handleSize, handleSize);
+    // Hit shader (group 3) 
+    memcpy(pData + hitOffset, m_shaderHandles.data() + 3 * handleSize, handleSize);
     m_hitRegion.deviceAddress = m_sbtBuffer.address + hitOffset;
     m_hitRegion.stride        = hitSize;
     m_hitRegion.size          = hitSize;
@@ -1076,6 +1055,7 @@ private:
     {
       eRaygen,
       eMiss,
+      eMissShadow,
       eClosestHit,
       eShaderGroupCount
     };
@@ -1089,9 +1069,15 @@ private:
     stages[eRaygen].pNext     = &shaderCode;
     stages[eRaygen].pName     = "rgenMain";
     stages[eRaygen].stage     = VK_SHADER_STAGE_RAYGEN_BIT_KHR;
+
     stages[eMiss].pNext       = &shaderCode;
     stages[eMiss].pName       = "rmissMain";
     stages[eMiss].stage       = VK_SHADER_STAGE_MISS_BIT_KHR;
+
+    stages[eMissShadow].pNext = &shaderCode;
+    stages[eMissShadow].pName = "rmissShadowMain";  
+    stages[eMissShadow].stage = VK_SHADER_STAGE_MISS_BIT_KHR;
+
     stages[eClosestHit].pNext = &shaderCode;
     stages[eClosestHit].pName = "rchitMain";
     stages[eClosestHit].stage = VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR;
@@ -1112,6 +1098,11 @@ private:
     // Miss
     group.type          = VK_RAY_TRACING_SHADER_GROUP_TYPE_GENERAL_KHR;
     group.generalShader = eMiss;
+    shader_groups.push_back(group);
+
+    // Shadow miss 
+    group.type = VK_RAY_TRACING_SHADER_GROUP_TYPE_GENERAL_KHR;
+    group.generalShader = eMissShadow;
     shader_groups.push_back(group);
 
     // closest hit shader
@@ -1140,7 +1131,6 @@ private:
     rtPipelineInfo.pStages                      = stages.data();
     rtPipelineInfo.groupCount                   = static_cast<uint32_t>(shader_groups.size());
     rtPipelineInfo.pGroups                      = shader_groups.data();
-    rtPipelineInfo.maxPipelineRayRecursionDepth = std::max(3U, m_rtProperties.maxRayRecursionDepth);// controls max num of times ray can recurisve call TraceRay
     rtPipelineInfo.maxPipelineRayRecursionDepth = std::max(MAX_DEPTH, m_rtProperties.maxRayRecursionDepth);  // Ray depth
     rtPipelineInfo.layout                       = m_rtPipelineLayout;
     vkCreateRayTracingPipelinesKHR(m_app->getDevice(), {}, {}, 1, &rtPipelineInfo, nullptr, &m_rtPipeline);
