@@ -4,6 +4,11 @@
 #include "nvshaders/sky_functions.h.slang"
 
 #define MISS_DEPTH 1000
+#define PHOTON_RAY_MARKER 999999
+
+#ifndef PI
+#define PI 3.14159265358979323846
+#endif
 
 //#define REFLECTION_RECURSIVE  // Hardware recursion approach
 #define REFLECTION_ITERATIVE    // Loop-based approach
@@ -17,6 +22,10 @@
 [[vk::binding(BindingPoints::eTlas, 1)]]        RaytracingAccelerationStructure topLevelAS;
 // Output image where the final rendered result will be stored
 [[vk::binding(BindingPoints::eOutImage, 1)]]    RWTexture2D<float4> outImage;
+
+[[vk::binding(BindingPoints::ePhotonBuffer, 1)]]  RWStructuredBuffer<Photon> photonBuffer;
+[[vk::binding(BindingPoints::ePhotonCounter, 1)]] RWStructuredBuffer<uint> photonCounter;
+
 // clang-format on
 
 // Ray payload structure - carries data through the ray tracing pipeline
@@ -139,6 +148,222 @@ GltfPunctual processLight(GltfSceneInfo sceneInfo, float3 worldPos)
   return light;
 }
 
+//-----------------------------------------------------------------------
+// PHOTON MAPPING HELPERS
+//-----------------------------------------------------------------------
+
+// Simple RNG for photon tracing
+struct RandomState
+{
+  uint state;
+};
+
+void initRandom(inout RandomState rng, uint seed)
+{
+  rng.state = seed;
+}
+
+float randomFloat(inout RandomState rng)
+{
+  rng.state = rng.state * 747796405u + 2891336453u;
+  uint result = ((rng.state >> ((rng.state >> 28u) + 4u)) ^ rng.state) * 277803737u;
+  result = (result >> 22u) ^ result;
+  return float(result) / 4294967295.0;
+}
+
+// Pack RGB into RGB9E5 format (shared exponent)
+uint packRGB9E5(float3 rgb)
+{
+  // Clamp to positive values
+  rgb = max(rgb, float3(0, 0, 0));
+  
+  // Find max component
+  float maxComponent = max(max(rgb.r, rgb.g), rgb.b);
+  
+  if(maxComponent < 1e-6)
+    return 0;
+  
+  // Calculate shared exponent
+  int exponent = int(floor(log2(maxComponent))) + 1;
+  exponent = clamp(exponent + 15, 0, 31);
+  
+  float scale = pow(2.0, float(exponent - 24));
+  
+  // Quantize mantissas
+  uint r = uint(clamp(rgb.r / scale + 0.5, 0.0, 511.0));
+  uint g = uint(clamp(rgb.g / scale + 0.5, 0.0, 511.0));
+  uint b = uint(clamp(rgb.b / scale + 0.5, 0.0, 511.0));
+  
+  return (exponent << 27) | (b << 18) | (g << 9) | r;
+}
+
+// Unpack RGB9E5 format
+float3 unpackRGB9E5(uint packed)
+{
+  int exponent = int((packed >> 27) & 0x1F);
+  uint r = packed & 0x1FF;
+  uint g = (packed >> 9) & 0x1FF;
+  uint b = (packed >> 18) & 0x1FF;
+  
+  float scale = pow(2.0, float(exponent - 24));
+  
+  return float3(float(r), float(g), float(b)) * scale;
+}
+
+// Generate random direction in hemisphere around normal
+float3 randomHemisphere(float3 normal, inout RandomState rng)
+{
+  float z = randomFloat(rng);
+  float r = sqrt(1.0 - z * z);
+  float phi = 2.0 * PI * randomFloat(rng);
+  
+  float3 dir = float3(r * cos(phi), r * sin(phi), z);
+  
+  // Create coordinate system from normal
+  float3 up = abs(normal.y) < 0.999 ? float3(0, 1, 0) : float3(1, 0, 0);
+  float3 tangent = normalize(cross(up, normal));
+  float3 bitangent = cross(normal, tangent);
+  
+  return normalize(tangent * dir.x + bitangent * dir.y + normal * dir.z);
+}
+
+// Gather photons at a point (brute force for now)
+float3 gatherPhotons(float3 worldPos, float3 worldNormal)
+{
+  if(pushConst.usePhotonMapping == 0)
+    return float3(0, 0, 0);
+  
+  float3 irradiance = float3(0, 0, 0);
+  float gatherRadius = 0.3;
+  
+  uint totalPhotons = photonCounter[0];
+  uint photonsFound = 0;
+  
+  // Stop early once we find enough photons
+  const uint MAX_SEARCH = min(totalPhotons, 50000u); // Don't search more than 50k
+  
+  for(uint i = 0; i < MAX_SEARCH; i++)  // CHANGED: was totalPhotons
+  {
+    Photon p = photonBuffer[i];
+    
+    float dist = length(worldPos - p.position);
+    
+    if(dist < gatherRadius)
+    {
+      float3 power = unpackRGB9E5(p.powerPacked);
+      
+      float normalizedDist = dist / gatherRadius;
+      float weight = exp(-3.0 * normalizedDist * normalizedDist);
+      
+      irradiance += power * weight;
+      photonsFound++;
+      
+      // Exit early when we have enough
+      if(photonsFound >= pushConst.photonGatherCount)
+        break;
+    }
+  }
+  
+  if(photonsFound > 0)
+  {
+    irradiance /= (PI * gatherRadius * gatherRadius);
+  }
+  
+  return irradiance;
+}
+
+// PHOTON TRACING RAY GENERATION
+[shader("raygeneration")]
+void photonRayGen()
+{
+  uint2 launchID = DispatchRaysIndex().xy;
+  uint2 launchSize = DispatchRaysDimensions().xy;
+  uint photonID = launchID.y * launchSize.x + launchID.x;
+  
+  if(photonID >= pushConst.photonsPerLight)
+    return;
+  
+  GltfSceneInfo sceneInfo = pushConst.sceneInfoAddress[0];
+  GltfPunctual light = sceneInfo.punctualLights[0];
+  
+  if(sceneInfo.useSky == 1)
+  {
+    light.direction = sceneInfo.skySimpleParam.sunDirection;
+    light.color = sceneInfo.skySimpleParam.sunColor;
+    light.intensity = sceneInfo.skySimpleParam.sunIntensity;
+    light.type = GltfLightType::eDirectional;
+  }
+  
+  RandomState rng;
+  initRandom(rng, photonID * 747796405u + 1u);
+  
+  RayDesc ray;
+  
+  // Divide total light power by number of photons
+  float3 totalLightPower = light.color * light.intensity;
+  float3 photonPower = totalLightPower / float(pushConst.photonsPerLight); 
+  
+  if(light.type == GltfLightType::eDirectional)
+  {
+    float r = sqrt(randomFloat(rng)) * 5.0;
+    float theta = randomFloat(rng) * 2.0 * PI;
+    
+    float3 diskOffset = float3(r * cos(theta), 0, r * sin(theta));
+    ray.Origin = float3(0, 0, 0) + diskOffset - light.direction * 10.0;
+    ray.Direction = light.direction;
+  }
+  else if(light.type == GltfLightType::ePoint)
+  {
+    ray.Origin = light.position;
+    float3 randomDir = randomHemisphere(float3(0, 1, 0), rng);
+    if(randomFloat(rng) > 0.5)
+      randomDir = -randomDir;
+    ray.Direction = randomDir;
+    
+    // Account for sphere solid angle
+    photonPower *= 4.0 * PI;
+  }
+  else if(light.type == GltfLightType::eSpot)
+  {
+    // ADD spot light support
+    ray.Origin = light.position;
+    
+    // Sample within cone
+    float cosAngle = cos(light.coneAngle);
+    float z = randomFloat(rng) * (1.0 - cosAngle) + cosAngle;
+    float phi = randomFloat(rng) * 2.0 * PI;
+    float r = sqrt(1.0 - z * z);
+    
+    // Build direction in cone space
+    float3 localDir = float3(r * cos(phi), r * sin(phi), z);
+    
+    // Transform to world space (align with light direction)
+    float3 up = abs(light.direction.y) < 0.999 ? float3(0, 1, 0) : float3(1, 0, 0);
+    float3 tangent = normalize(cross(up, light.direction));
+    float3 bitangent = cross(light.direction, tangent);
+    
+    ray.Direction = normalize(
+      tangent * localDir.x +
+      bitangent * localDir.y +
+      light.direction * localDir.z
+    );
+    
+    // Account for cone solid angle
+    float coneSolidAngle = 2.0 * PI * (1.0 - cosAngle);
+    photonPower *= coneSolidAngle;
+  }
+  
+  ray.TMin = 0.001;
+  ray.TMax = INFINITE;
+  
+  HitPayload payload;
+  payload.color = photonPower;  
+  payload.weight = 1.0;
+  payload.depth = PHOTON_RAY_MARKER;
+  
+  TraceRay(topLevelAS, RAY_FLAG_FORCE_OPAQUE, 0xff, 0, 0, 0, ray, payload);
+}
+
 // Ray generation shader - entry point for each pixel
 [shader("raygeneration")]
 void rgenMain()
@@ -206,11 +431,48 @@ void rgenMain()
 [shader("closesthit")]
 void rchitMain(inout HitPayload payload, in BuiltInTriangleIntersectionAttributes attr)
 {
-    // For now, just set a simple solid red color for all hits
-    // In a full implementation, this would:
-    // 1. Sample material properties (albedo, normal, etc.)
-    // 2. Calculate lighting (direct + indirect)
-    // 3. Potentially cast secondary rays (reflection, refraction)
+
+   // Check if this is a photon tracing ray (hacky but simple)
+  bool isPhotonRay = (payload.depth == PHOTON_RAY_MARKER); // Photon IDs are large
+  if(isPhotonRay && pushConst.usePhotonMapping == 1)
+  {
+    // PHOTON STORAGE PATH
+    
+    // Get hit information
+    float3 barycentrics = float3(1 - attr.barycentrics.x - attr.barycentrics.y, 
+                                 attr.barycentrics.x, attr.barycentrics.y);
+    
+    uint instanceID = InstanceIndex();
+    uint triID = PrimitiveIndex();
+    
+    GltfSceneInfo sceneInfo = pushConst.sceneInfoAddress[0];
+    GltfInstance instance = sceneInfo.instances[instanceID];
+    GltfMesh mesh = sceneInfo.meshes[instance.meshIndex];
+    
+    // Get world position
+    int3 indices = getTriangleIndices(mesh.gltfBuffer, mesh.triMesh, triID);
+    float3 pos = getTriangleAttribute<float3>(mesh.gltfBuffer, mesh.triMesh.positions, 
+                                              indices, barycentrics);
+    float3 worldPos = float3(mul(float4(pos, 1.0), ObjectToWorld4x3()));
+    
+    // Store photon atomically
+    uint photonIndex;
+    InterlockedAdd(photonCounter[0], 1, photonIndex);
+    
+    if(photonIndex < pushConst.photonsPerLight)
+    {
+      Photon p;
+      p.position = worldPos;
+      p.direction = -WorldRayDirection();
+      p.powerPacked = packRGB9E5(payload.color);
+      p._padding = 0;
+      
+      photonBuffer[photonIndex] = p;
+    }
+    
+    // Don't continue bouncing for now
+    return;
+  }
 
     // Get barycentric coordinates (pts position in triangle using weights based on tris 3 vertices)
     float3 barycentrics = float3(1 - attr.barycentrics.x - attr.barycentrics.y, attr.barycentrics.x, attr.barycentrics.y);
@@ -251,6 +513,12 @@ void rchitMain(inout HitPayload payload, in BuiltInTriangleIntersectionAttribute
     // Calculate PBR lighting with shadow factor
     float3 color = pbrMetallicRoughness(albedo, metallic, roughness, N, V, L);
     color *= light.color * light.intensity * shadowFactor;
+
+    if(pushConst.usePhotonMapping == 1)
+    {
+      float3 indirectLight = gatherPhotons(worldPos, N);
+      color += indirectLight * albedo / PI; // Simple diffuse reflection
+    }
 
   // Handle reflection based on material properties
   float3 reflectionColor = float3(0, 0, 0);

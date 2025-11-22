@@ -30,6 +30,8 @@ enum BindingPoints
   eTextures = 0,  // Binding point for textures
   eOutImage,      // Binding point for output image
   eTlas,          // Top-level acceleration structure
+  ePhotonBuffer,
+  ePhotonCounter
 };
 
 
@@ -39,8 +41,20 @@ struct TutoPushConstant
   int            instanceIndex;              // Instance index for the current draw call
   GltfSceneInfo* sceneInfoAddress;           // Address of the scene information buffer
   float2         metallicRoughnessOverride;  // Metallic and roughness override values
-
   int depthMax = 3; // maximum reflection depth
+
+
+  int usePhotonMapping;   // toggle photon mapping
+  int photonsPerLight;    //how many photons to trace
+  int photonGatherCount;  // how many photons to gather (K-nearest)
+};
+
+struct Photon
+{
+  float3 position;     // 12 bytes - world position where photon hit
+  uint   powerPacked;  // 4 bytes  - RGB9E5 packed photon power
+  float3 direction;    // 12 bytes - incoming light direction
+  float  _padding;     // 4 bytes  - alignment
 };
 
 NAMESPACE_SHADERIO_END()

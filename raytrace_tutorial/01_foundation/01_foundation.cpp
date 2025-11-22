@@ -186,6 +186,8 @@ public:
     // Set up ray tracing pipeline infrastructure
     createRaytraceDescriptorLayout();  // Create descriptor layout
     createRayTracingPipeline();        // Create pipeline structure and SBT
+
+    createPhotonBuffers();
   }
 
   //-------------------------------------------------------------------------------
@@ -234,8 +236,12 @@ public:
     vkDestroyPipeline(device, m_rtPipeline, nullptr);
     m_rtDescPack.deinit();
     m_allocator.destroyBuffer(m_sbtBuffer);
+    m_allocator.destroyBuffer(m_photonBuffer);
+    m_allocator.destroyBuffer(m_photonCounterBuffer);
 
     m_allocator.deinit();
+
+
 
   }
 
@@ -256,6 +262,22 @@ public:
     if(ImGui::Begin("Settings"))
     {
       ImGui::Checkbox("Use Ray Tracing", &m_useRayTracing);
+
+      ImGui::SeparatorText("Photon Mapping");
+      {
+        PE::begin();
+        PE::Checkbox("Enable Photon Mapping", &m_usePhotonMapping, "Enable indirect lighting via photon mapping");
+
+        if(m_usePhotonMapping)
+        {
+          PE::SliderInt("Photons Per Light", &m_photonsPerLight, 1000, 100000, "%d", ImGuiSliderFlags_Logarithmic,
+                        "Number of photons to trace from each light");
+          PE::SliderInt("Gather Count", &m_photonGatherCount, 10, 200, "%d", ImGuiSliderFlags_AlwaysClamp,
+                        "Number of nearby photons to gather (K-nearest)");
+        }
+        PE::end();
+      }
+
 
       ImGui::SeparatorText("Reflection");
       {
@@ -333,6 +355,7 @@ public:
   {
     NVVK_DBG_SCOPE(cmd);  // <-- Helps to debug in NSight
 
+
     // Update the scene information buffer, this cannot be done in between dynamic rendering
     updateSceneBuffer(cmd);
 
@@ -398,51 +421,74 @@ public:
   {
     SCOPED_TIMER(__FUNCTION__);
 
-    VkCommandBuffer cmd              = m_app->createTempCmdBuffer();
-    m_sceneResource.sceneInfo.useSky = true;  // Use sky for lighting
+    VkCommandBuffer cmd = m_app->createTempCmdBuffer();
 
     // Load the GLTF resources
     {
-      tinygltf::Model wusonModel =
-          nvsamples::loadGltfResources(nvutils::findFile("wuson.glb", nvsamples::getResourcesDirs()));  // Load the GLTF resources from the file
+      tinygltf::Model teapotModel =
+          nvsamples::loadGltfResources(nvutils::findFile("cornell.gltf", nvsamples::getResourcesDirs()));  // Load the GLTF resources from the file
 
       tinygltf::Model planeModel =
           nvsamples::loadGltfResources(nvutils::findFile("plane.gltf", nvsamples::getResourcesDirs()));  // Load the GLTF resources from the file
 
-      // Import and create the glTF data buffer
-      nvsamples::importGltfData(m_sceneResource, wusonModel, m_stagingUploader, false);
-      nvsamples::importGltfData(m_sceneResource, planeModel, m_stagingUploader, false);
+      // Textures
+      {
+        std::filesystem::path imageFilename = nvutils::findFile("tiled_floor.png", nvsamples::getResourcesDirs());
+        nvvk::Image texture = nvsamples::loadAndCreateImage(cmd, m_stagingUploader, m_app->getDevice(), imageFilename);  // Load the image from the file and create a texture from it
+        NVVK_DBG_NAME(texture.image);
+        m_samplerPool.acquireSampler(texture.descriptor.sampler);
+        m_textures.emplace_back(texture);  // Store the texture in the vector of textures
+      }
+
+      // Upload the GLTF resources to the GPU
+      {
+        nvsamples::importGltfData(m_sceneResource, teapotModel, m_stagingUploader);  // Import the GLTF resources
+        nvsamples::importGltfData(m_sceneResource, planeModel, m_stagingUploader);   // Import the GLTF resources
+      }
     }
 
-    // Create materials
+
     m_sceneResource.materials = {
-        {.baseColorFactor = glm::vec4(0.8f, 1.0f, 0.6f, 1.0f), .metallicFactor = 0.5f, .roughnessFactor = 0.5f},  // Bronze
-        {.baseColorFactor = glm::vec4(.7f, .17f, .17f, 1.0f), .metallicFactor = 0.1f, .roughnessFactor = 0.1f},  // Grey
-        {.baseColorFactor = glm::vec4(0.8f, 0.8f, 1.0f, 1.0f), .metallicFactor = 0.99f, .roughnessFactor = 0.01f},  // Mirror
-    };
+        // Teapot material
+        {.baseColorFactor = glm::vec4(0.8f, 1.0f, 0.6f, 1.0f), .metallicFactor = 0.5f, .roughnessFactor = 0.5f},
+        // Plane material with texture
+        {.baseColorFactor = glm::vec4(1.0f, 1.0f, 1.0f, 1.0f), .metallicFactor = 0.1f, .roughnessFactor = 0.8f, .baseColorTextureIndex = 0}};
+
 
     m_sceneResource.instances = {
-        // Wuson
-        {.transform = glm::mat4(1.f), .materialIndex = 0, .meshIndex = 0},
-        {.transform = glm::scale(glm::translate(glm::mat4(1), glm::vec3(0, 0, 0)), glm::vec3(2.f)), .materialIndex = 1, .meshIndex = 1},  // Plane
-        // Left mirror
-        {.transform = glm::rotate(glm::translate(glm::mat4(1), glm::vec3(-1.5f, 0, 0)), glm::radians(-90.0f), glm::vec3(0, 0, 1)),
-         .materialIndex = 2,
-         .meshIndex     = 1},
-        // Right mirror
-        {.transform = glm::rotate(glm::translate(glm::mat4(1), glm::vec3(1.5f, 0, 0)), glm::radians(90.0f), glm::vec3(0, 0, 1)),
-         .materialIndex = 2,
-         .meshIndex     = 1},
+        // Teapot
+        {.transform     = glm::translate(glm::mat4(1), glm::vec3(0, 0, 0)) * glm::scale(glm::mat4(1), glm::vec3(0.5f)),
+         .materialIndex = 0,
+         .meshIndex     = 0},
+        // Plane
+        {.transform = glm::scale(glm::translate(glm::mat4(1), glm::vec3(0, -0.9f, 0)), glm::vec3(2.f)), .materialIndex = 1, .meshIndex = 1},
     };
 
-    // Create buffers for the scene data (GPU buffers)
-    nvsamples::createGltfSceneInfoBuffer(m_sceneResource, m_stagingUploader);
 
-    m_stagingUploader.cmdUploadAppended(cmd);  // Upload the resources
-    m_app->submitAndWaitTempCmdBuffer(cmd);    // Submit the command buffer to upload the resources
+    nvsamples::createGltfSceneInfoBuffer(m_sceneResource, m_stagingUploader);  // Create buffers for the scene data (GPU buffers)
 
-    // Set up camera
-    m_cameraManip->setLookat({1.03534, 1.19964, -2.07709}, {-0.05626, 0.81966, -1.40429}, {0.00000, 1.00000, 0.00000});
+    m_stagingUploader.cmdUploadAppended(cmd);  // Upload the scene information to the GPU
+
+    // Scene information
+    shaderio::GltfSceneInfo& sceneInfo = m_sceneResource.sceneInfo;
+    sceneInfo.useSky                   = false;                                         // Use light
+    sceneInfo.instances = (shaderio::GltfInstance*)m_sceneResource.bInstances.address;  // Address of the instance buffer
+    sceneInfo.meshes = (shaderio::GltfMesh*)m_sceneResource.bMeshes.address;            // Address of the mesh buffer
+    sceneInfo.materials = (shaderio::GltfMetallicRoughness*)m_sceneResource.bMaterials.address;  // Address of the material buffer
+    sceneInfo.backgroundColor             = {0.85f, 0.85f, 0.85f};                               // The background color
+    sceneInfo.numLights                   = 1;
+    sceneInfo.punctualLights[0].color     = glm::vec3(1.0f, 1.0f, 1.0f);
+    sceneInfo.punctualLights[0].intensity = 4.0f;
+    sceneInfo.punctualLights[0].position  = glm::vec3(1.0f, 1.0f, 1.0f);  // Position of the light
+    sceneInfo.punctualLights[0].direction = glm::vec3(1.0f, 1.0f, 1.0f);  // Direction to the light
+    sceneInfo.punctualLights[0].type      = shaderio::GltfLightType::ePoint;
+    sceneInfo.punctualLights[0].coneAngle = 0.9f;  // Cone angle for spot lights (0 for point and directional lights)
+
+    m_app->submitAndWaitTempCmdBuffer(cmd);  // Submit the command buffer to upload the resources
+
+    // Default camera
+    m_cameraManip->setClipPlanes({0.01F, 100.0F});
+    m_cameraManip->setLookat({0.0F, 0.5F, 5.0}, {0.F, 0.F, 0.F}, {0.0F, 1.0F, 0.0F});
   }
 
 
@@ -950,16 +996,119 @@ private:
 
   shaderio::TutoPushConstant m_pushValues{};  // Push constant values used to pass data to the shaders
 
-  void createShaderBindingTable(const VkRayTracingPipelineCreateInfoKHR& rtPipelineInfo)
+  // Photon Mapping Components
+  nvvk::Buffer m_photonBuffer;          // Storage for photons
+  uint32_t     m_maxPhotons = 1000000;  // Max photons we can store
+  nvvk::Buffer m_photonCounterBuffer;   // Atomic counter for photon storage
+
+  bool m_usePhotonMapping  = false;  // Toggle in UI
+  int  m_photonsPerLight   = 10000;  // Photons to trace
+  int  m_photonGatherCount = 50;     // K-nearest for gathering
+
+  VkStridedDeviceAddressRegionKHR m_photonRaygenRegion{};  // NEW: For photon tracing
+
+
+  void createPhotonBuffers()
+  {
+    SCOPED_TIMER(__FUNCTION__);
+
+    VkCommandBuffer cmd = m_app->createTempCmdBuffer();
+
+    // Create photon storage buffer
+    NVVK_CHECK(m_allocator.createBuffer(m_photonBuffer, sizeof(shaderio::Photon) * m_maxPhotons,
+                                        VK_BUFFER_USAGE_2_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_2_SHADER_DEVICE_ADDRESS_BIT,
+                                        VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE));
+    NVVK_DBG_NAME(m_photonBuffer.buffer);
+
+    // Create counter buffer (single uint32_t) needs to be modified by shader thus using storage buffer
+    NVVK_CHECK(m_allocator.createBuffer(m_photonCounterBuffer, sizeof(uint32_t),
+                                        VK_BUFFER_USAGE_2_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_2_TRANSFER_DST_BIT | VK_BUFFER_USAGE_2_SHADER_DEVICE_ADDRESS_BIT,
+                                        VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE));
+    NVVK_DBG_NAME(m_photonCounterBuffer.buffer);
+
+    // Initialize counter to 0
+    vkCmdFillBuffer(cmd, m_photonCounterBuffer.buffer, 0, sizeof(uint32_t), 0);
+
+    m_app->submitAndWaitTempCmdBuffer(cmd);
+
+    LOGI("Photon buffers created (max: %d photons)\n", m_maxPhotons);
+  }
+
+  void tracePhotons(VkCommandBuffer cmd)
+  {
+    NVVK_DBG_SCOPE(cmd);
+
+    // reset photon buffer and count
+    vkCmdFillBuffer(cmd, m_photonBuffer.buffer, 0, sizeof(shaderio::Photon) * m_maxPhotons, 0);
+    vkCmdFillBuffer(cmd, m_photonCounterBuffer.buffer, 0, sizeof(uint32_t), 0);
+
+ 
+    nvvk::cmdBufferMemoryBarrier(cmd, {m_photonCounterBuffer.buffer, VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+                                       VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR});
+
+    nvvk::cmdBufferMemoryBarrier(cmd, {m_photonBuffer.buffer, VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+                                       VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR});
+
+    // Bind the same ray tracing pipeline, using different raygen shader point
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR, m_rtPipeline);
+
+    // Bind texture descriptor sets
+    const VkBindDescriptorSetsInfo bindDescriptorSetsInfo{.sType      = VK_STRUCTURE_TYPE_BIND_DESCRIPTOR_SETS_INFO,
+                                                          .stageFlags = VK_SHADER_STAGE_ALL,
+                                                          .layout     = m_rtPipelineLayout,
+                                                          .firstSet   = 0,
+                                                          .descriptorSetCount = 1,
+                                                          .pDescriptorSets    = m_descPack.getSetPtr()};
+    vkCmdBindDescriptorSets2(cmd, &bindDescriptorSetsInfo);
+
+ 
+    // MUST include ALL bindings in the layout, even if photon shader doesn't use outImage
+    nvvk::WriteSetContainer write{};
+    write.append(m_rtDescPack.makeWrite(shaderio::BindingPoints::eTlas), m_tlasAccel);
+    write.append(m_rtDescPack.makeWrite(shaderio::BindingPoints::eOutImage), m_gBuffers.getColorImageView(eImgRendered),
+                 VK_IMAGE_LAYOUT_GENERAL);  
+    write.append(m_rtDescPack.makeWrite(shaderio::BindingPoints::ePhotonBuffer), m_photonBuffer);
+    write.append(m_rtDescPack.makeWrite(shaderio::BindingPoints::ePhotonCounter), m_photonCounterBuffer);
+
+    vkCmdPushDescriptorSetKHR(cmd, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR, m_rtPipelineLayout, 1, write.size(), write.data());
+
+    // Push constants
+    shaderio::TutoPushConstant pushValues{
+        .sceneInfoAddress = (shaderio::GltfSceneInfo*)m_sceneResource.bSceneInfo.address,
+        .usePhotonMapping = 1,
+        .photonsPerLight  = m_photonsPerLight,
+    };
+
+    const VkPushConstantsInfo pushInfo{.sType      = VK_STRUCTURE_TYPE_PUSH_CONSTANTS_INFO,
+                                       .layout     = m_rtPipelineLayout,
+                                       .stageFlags = VK_SHADER_STAGE_ALL,
+                                       .size       = sizeof(shaderio::TutoPushConstant),
+                                       .pValues    = &pushValues};
+    vkCmdPushConstants2(cmd, &pushInfo);
+
+    // Calculate photon grid dimensions (sqrt for roughly square dispatch)
+    uint32_t photonsToTrace = m_photonsPerLight;
+    uint32_t sqrtPhotons    = static_cast<uint32_t>(std::sqrt(photonsToTrace));
+    uint32_t gridX          = sqrtPhotons;
+    uint32_t gridY          = (photonsToTrace + gridX - 1) / gridX;
+
+    // This calls photonRayGen() shader
+    vkCmdTraceRaysKHR(cmd, &m_photonRaygenRegion, &m_missRegion, &m_hitRegion, &m_callableRegion, gridX, gridY, 1);
+
+    // Memory barrier, wait for photon tracing to complete before camera rays use them
+    nvvk::cmdMemoryBarrier(cmd, VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR, VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR);
+  }
+
+void createShaderBindingTable(const VkRayTracingPipelineCreateInfoKHR& rtPipelineInfo)
   {
     SCOPED_TIMER(__FUNCTION__);
     m_allocator.destroyBuffer(m_sbtBuffer);  // Cleanup when re-creating
 
-    VkDevice device          = m_app->getDevice();
-    uint32_t handleSize      = m_rtProperties.shaderGroupHandleSize; 
-    uint32_t handleAlignment = m_rtProperties.shaderGroupHandleAlignment; // aligned for individual shader group handle sizes
-    uint32_t baseAlignment   = m_rtProperties.shaderGroupBaseAlignment; // alignment for buffer device address where each SBT region starts
-    uint32_t groupCount      = rtPipelineInfo.groupCount;
+    VkDevice device     = m_app->getDevice();
+    uint32_t handleSize = m_rtProperties.shaderGroupHandleSize;
+    uint32_t handleAlignment = m_rtProperties.shaderGroupHandleAlignment;  // aligned for individual shader group handle sizes
+    uint32_t baseAlignment = m_rtProperties.shaderGroupBaseAlignment;  // alignment for buffer device address where each SBT region starts
+    uint32_t groupCount = rtPipelineInfo.groupCount;
 
     // Get shader group handles
     // used by GPU to identify which shader to execute for each ray type
@@ -968,15 +1117,19 @@ private:
     NVVK_CHECK(vkGetRayTracingShaderGroupHandlesKHR(device, m_rtPipeline, 0, groupCount, dataSize, m_shaderHandles.data()));
 
     // Calculate SBT buffer size with proper alignment
-    auto     alignUp      = [](uint32_t size, uint32_t alignment) { return (size + alignment - 1) & ~(alignment - 1); };
-    uint32_t raygenSize   = alignUp(handleSize, handleAlignment);
-    uint32_t missSize     = alignUp(handleSize * 2, handleAlignment);
-    uint32_t hitSize      = alignUp(handleSize, handleAlignment);
-    uint32_t callableSize = 0;  // No callable shaders in this tutorial
+    auto alignUp = [](uint32_t size, uint32_t alignment) { return (size + alignment - 1) & ~(alignment - 1); };
+
+    // Each raygen shader region must be aligned to baseAlignment (64 bytes)
+    uint32_t raygenCameraSize = baseAlignment;  // Camera raygen region
+    uint32_t raygenPhotonSize = baseAlignment;  // Photon raygen region
+    uint32_t missSize         = alignUp(handleSize * 2, handleAlignment);
+    uint32_t hitSize          = alignUp(handleSize, handleAlignment);
+    uint32_t callableSize     = 0;  // No callable shaders in this tutorial
 
     // Ensure each region starts at a baseAlignment boundary
-    uint32_t raygenOffset   = 0;
-    uint32_t missOffset     = alignUp(raygenSize, baseAlignment);
+    uint32_t raygenCameraOffset = 0;
+    uint32_t raygenPhotonOffset = alignUp(raygenCameraOffset + raygenCameraSize, baseAlignment);  // Align to baseAlignment
+    uint32_t missOffset     = alignUp(raygenPhotonOffset + raygenPhotonSize, baseAlignment);
     uint32_t hitOffset      = alignUp(missOffset + missSize, baseAlignment);
     uint32_t callableOffset = alignUp(hitOffset + hitSize, baseAlignment);
 
@@ -985,32 +1138,44 @@ private:
     // Create SBT buffer
     // cpu fast write memory, gpu slower reads. better for frequently updated data vs staging approach
     NVVK_CHECK(m_allocator.createBuffer(m_sbtBuffer, bufferSize, VK_BUFFER_USAGE_2_SHADER_BINDING_TABLE_BIT_KHR, VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
-                                        VMA_ALLOCATION_CREATE_MAPPED_BIT | VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT));
+                                        VMA_ALLOCATION_CREATE_MAPPED_BIT | VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT,
+                                        baseAlignment));  // Pass alignment to ensure buffer starts at aligned address
     NVVK_DBG_NAME(m_sbtBuffer.buffer);
 
     // Populate SBT buffer
-    uint8_t* pData = static_cast<uint8_t*>(m_sbtBuffer.mapping); // ptr to cpu-accessible memory of sbt buffer. directly write to it!
+    uint8_t* pData = static_cast<uint8_t*>(m_sbtBuffer.mapping);  // ptr to cpu-accessible memory of sbt buffer. directly write to it!
 
-    // each shader type gets its own region in SBT buffer, filled below 
-    
-    // Ray generation shader (group 0)
-    memcpy(pData + raygenOffset, // desintation
-        m_shaderHandles.data() + 0 * handleSize, // source (got from vkGetRTGroupHandlesKHR above)
-        handleSize); // size
-    m_raygenRegion.deviceAddress = m_sbtBuffer.address + raygenOffset;
-    m_raygenRegion.stride        = raygenSize;
-    m_raygenRegion.size          = raygenSize;
+    // each shader type gets its own region in SBT buffer, filled below
 
-    // Miss shaders (groups 1 and 2) - BOTH primary and shadow miss
-    memcpy(pData + missOffset, m_shaderHandles.data() + 1 * handleSize, handleSize);  // Primary miss
+    // Ray generation shaders (groups 0 and 1)
+    // Camera raygen (group 0)
+    memcpy(pData + raygenCameraOffset,               // destination
+           m_shaderHandles.data() + 0 * handleSize,  // source (got from vkGetRTGroupHandlesKHR above)
+           handleSize);                              // size
+
+    // Photon raygen (group 1)
+    memcpy(pData + raygenPhotonOffset, m_shaderHandles.data() + 1 * handleSize, handleSize);
+
+    // Camera raygen region (first entry)
+    m_raygenRegion.deviceAddress = m_sbtBuffer.address + raygenCameraOffset;
+    m_raygenRegion.stride        = raygenCameraSize;
+    m_raygenRegion.size          = raygenCameraSize;
+
+    // Photon raygen region (second entry) - starts at next aligned offset
+    m_photonRaygenRegion.deviceAddress = m_sbtBuffer.address + raygenPhotonOffset;
+    m_photonRaygenRegion.stride        = raygenPhotonSize;
+    m_photonRaygenRegion.size          = raygenPhotonSize;
+
+    // Miss shaders (groups 2 and 3) - BOTH primary and shadow miss
+    memcpy(pData + missOffset, m_shaderHandles.data() + 2 * handleSize, handleSize);  // Primary miss
     memcpy(pData + missOffset + alignUp(handleSize, handleAlignment),                 // Shadow miss
-           m_shaderHandles.data() + 2 * handleSize, handleSize);
+           m_shaderHandles.data() + 3 * handleSize, handleSize);
     m_missRegion.deviceAddress = m_sbtBuffer.address + missOffset;
     m_missRegion.stride        = alignUp(handleSize, handleAlignment);  // Stride between miss shaders
     m_missRegion.size          = missSize;                              // Total size for both
 
-    // Hit shader (group 3) 
-    memcpy(pData + hitOffset, m_shaderHandles.data() + 3 * handleSize, handleSize);
+    // Hit shader (group 4)
+    memcpy(pData + hitOffset, m_shaderHandles.data() + 4 * handleSize, handleSize);
     m_hitRegion.deviceAddress = m_sbtBuffer.address + hitOffset;
     m_hitRegion.stride        = hitSize;
     m_hitRegion.size          = hitSize;
@@ -1020,7 +1185,7 @@ private:
     m_callableRegion.stride        = 0;
     m_callableRegion.size          = 0;
 
-    LOGI("Shader binding table created and populated \n");
+    LOGI("Shader binding table created with 2 raygen shaders and populated\n");
   }
 
   void createRaytraceDescriptorLayout()
@@ -1033,6 +1198,17 @@ private:
                          .stageFlags      = VK_SHADER_STAGE_ALL});
     bindings.addBinding({.binding         = shaderio::BindingPoints::eOutImage,
                          .descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+                         .descriptorCount = 1,
+                         .stageFlags      = VK_SHADER_STAGE_ALL});
+
+      // photon buffer bindings
+    bindings.addBinding({.binding         = shaderio::BindingPoints::ePhotonBuffer,
+                         .descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                         .descriptorCount = 1,
+                         .stageFlags      = VK_SHADER_STAGE_ALL});
+
+    bindings.addBinding({.binding         = shaderio::BindingPoints::ePhotonCounter,
+                         .descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
                          .descriptorCount = 1,
                          .stageFlags      = VK_SHADER_STAGE_ALL});
 
@@ -1053,7 +1229,8 @@ private:
     // Creating all shaders
     enum StageIndices
     {
-      eRaygen,
+      eRaygenCamera,
+      eRaygenPhoton,
       eMiss,
       eMissShadow,
       eClosestHit,
@@ -1066,13 +1243,19 @@ private:
     // Compile shader, fallback to pre-compiled
     VkShaderModuleCreateInfo shaderCode = compileSlangShader("rtbasic.slang", rtbasic_slang);
 
-    stages[eRaygen].pNext     = &shaderCode;
-    stages[eRaygen].pName     = "rgenMain";
-    stages[eRaygen].stage     = VK_SHADER_STAGE_RAYGEN_BIT_KHR;
+    // Camera raygen
+    stages[eRaygenCamera].pNext = &shaderCode;
+    stages[eRaygenCamera].pName = "rgenMain";
+    stages[eRaygenCamera].stage = VK_SHADER_STAGE_RAYGEN_BIT_KHR;
 
-    stages[eMiss].pNext       = &shaderCode;
-    stages[eMiss].pName       = "rmissMain";
-    stages[eMiss].stage       = VK_SHADER_STAGE_MISS_BIT_KHR;
+    // Photon raygen
+    stages[eRaygenPhoton].pNext = &shaderCode;
+    stages[eRaygenPhoton].pName = "photonRayGen";
+    stages[eRaygenPhoton].stage = VK_SHADER_STAGE_RAYGEN_BIT_KHR;
+
+    stages[eMiss].pNext = &shaderCode;
+    stages[eMiss].pName = "rmissMain";
+    stages[eMiss].stage = VK_SHADER_STAGE_MISS_BIT_KHR;
 
     stages[eMissShadow].pNext = &shaderCode;
     stages[eMissShadow].pName = "rmissShadowMain";  
@@ -1090,9 +1273,15 @@ private:
     group.intersectionShader = VK_SHADER_UNUSED_KHR;
 
     std::vector<VkRayTracingShaderGroupCreateInfoKHR> shader_groups;
-    // Raygen
+
+    // Camera Raygen 
     group.type          = VK_RAY_TRACING_SHADER_GROUP_TYPE_GENERAL_KHR;
-    group.generalShader = eRaygen;
+    group.generalShader = eRaygenCamera;
+    shader_groups.push_back(group);
+
+    // Photon Raygen 
+    group.type          = VK_RAY_TRACING_SHADER_GROUP_TYPE_GENERAL_KHR;
+    group.generalShader = eRaygenPhoton;
     shader_groups.push_back(group);
 
     // Miss
@@ -1146,6 +1335,12 @@ private:
   {
     NVVK_DBG_SCOPE(cmd);  // <-- Helps to debug in NSight
 
+      // PASS 1: Trace Photons 
+    if(m_usePhotonMapping)
+    {
+      tracePhotons(cmd);
+    }
+
     // Ray trace pipeline
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR, m_rtPipeline);
 
@@ -1163,12 +1358,21 @@ private:
     write.append(m_rtDescPack.makeWrite(shaderio::BindingPoints::eTlas), m_tlasAccel);
     write.append(m_rtDescPack.makeWrite(shaderio::BindingPoints::eOutImage), m_gBuffers.getColorImageView(eImgRendered),
                  VK_IMAGE_LAYOUT_GENERAL);
+
+    write.append(m_rtDescPack.makeWrite(shaderio::BindingPoints::ePhotonBuffer), m_photonBuffer);
+    write.append(m_rtDescPack.makeWrite(shaderio::BindingPoints::ePhotonCounter), m_photonCounterBuffer);
+
+
+
     vkCmdPushDescriptorSetKHR(cmd, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR, m_rtPipelineLayout, 1, write.size(), write.data());
 
     // Push constant information
     shaderio::TutoPushConstant pushValues{
         .sceneInfoAddress = (shaderio::GltfSceneInfo*)m_sceneResource.bSceneInfo.address,
-        .depthMax = m_pushValues.depthMax
+        .depthMax = m_pushValues.depthMax,
+        .usePhotonMapping  = m_usePhotonMapping ? 1 : 0,  
+        .photonsPerLight   = m_photonsPerLight,           
+        .photonGatherCount = m_photonGatherCount,         
     };
     const VkPushConstantsInfo pushInfo{.sType      = VK_STRUCTURE_TYPE_PUSH_CONSTANTS_INFO,
                                        .layout     = m_rtPipelineLayout,
