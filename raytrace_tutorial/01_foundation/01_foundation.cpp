@@ -188,6 +188,7 @@ public:
     createRayTracingPipeline();        // Create pipeline structure and SBT
 
     createPhotonBuffers();
+    createEmptyOctreeBuffers();  // NEW: Create empty buffers to avoid validation errors
   }
 
   //-------------------------------------------------------------------------------
@@ -239,6 +240,9 @@ public:
     m_allocator.destroyBuffer(m_photonBuffer);
     m_allocator.destroyBuffer(m_photonCounterBuffer);
 
+    m_allocator.destroyBuffer(m_octreeBuffer);
+    m_allocator.destroyBuffer(m_octreeParamsBuffer);
+
     m_allocator.deinit();
 
 
@@ -270,10 +274,16 @@ public:
 
         if(m_usePhotonMapping)
         {
-          PE::SliderInt("Photons Per Light", &m_photonsPerLight, 1000, 100000, "%d", ImGuiSliderFlags_Logarithmic,
+          PE::SliderInt("Photons Per Light", &m_photonsPerLight, 1000, 10000000, "%d", ImGuiSliderFlags_Logarithmic,
                         "Number of photons to trace from each light");
-          PE::SliderInt("Gather Count", &m_photonGatherCount, 10, 200, "%d", ImGuiSliderFlags_AlwaysClamp,
-                        "Number of nearby photons to gather (K-nearest)");
+          PE::SliderFloat("Gather Radius", &m_photonGatherRadius, 0.01f, 0.6f, "%.3f", ImGuiSliderFlags_AlwaysClamp,
+                          "Radius to gather photons from");
+
+          if(PE::Button("Retrace Photons", ImVec2(-1, 0)))
+          {
+            m_retracePM = true; 
+          }
+
         }
         PE::end();
       }
@@ -355,6 +365,25 @@ public:
   {
     NVVK_DBG_SCOPE(cmd);  // <-- Helps to debug in NSight
 
+    if(m_needOctreeRebuild)
+    {
+      LOGI("Rebuilding octree before next frame...\n");
+
+      // Wait for ALL GPU work from previous frame to complete
+      vkDeviceWaitIdle(m_app->getDevice());
+
+      // Now safe to read back and rebuild
+      // 
+      // CPU READS photons from GPU, stores in m_cpuPhotons
+      readPhotonsFromGPU();
+      // CPU BUILDS octree using m_cpuPhotons
+      buildPhotonOctree();
+
+      m_needOctreeRebuild = false;
+
+      LOGI("Octree rebuild complete\n");
+    }
+
 
     // Update the scene information buffer, this cannot be done in between dynamic rendering
     updateSceneBuffer(cmd);
@@ -420,75 +449,81 @@ public:
   void createScene()
   {
     SCOPED_TIMER(__FUNCTION__);
-
     VkCommandBuffer cmd = m_app->createTempCmdBuffer();
 
-    // Load the GLTF resources
+    // load model
     {
-      tinygltf::Model teapotModel =
-          nvsamples::loadGltfResources(nvutils::findFile("cornell.gltf", nvsamples::getResourcesDirs()));  // Load the GLTF resources from the file
+      tinygltf::Model cornellBoxModel =
+          nvsamples::loadGltfResources(nvutils::findFile("CornellBox.gltf", nvsamples::getResourcesDirs()));
 
-      tinygltf::Model planeModel =
-          nvsamples::loadGltfResources(nvutils::findFile("plane.gltf", nvsamples::getResourcesDirs()));  // Load the GLTF resources from the file
+      // Upload model resources to the GPU
+      nvsamples::importGltfData(m_sceneResource, cornellBoxModel, m_stagingUploader, true);  // true = import instances
 
-      // Textures
-      {
-        std::filesystem::path imageFilename = nvutils::findFile("tiled_floor.png", nvsamples::getResourcesDirs());
-        nvvk::Image texture = nvsamples::loadAndCreateImage(cmd, m_stagingUploader, m_app->getDevice(), imageFilename);  // Load the image from the file and create a texture from it
-        NVVK_DBG_NAME(texture.image);
-        m_samplerPool.acquireSampler(texture.descriptor.sampler);
-        m_textures.emplace_back(texture);  // Store the texture in the vector of textures
-      }
-
-      // Upload the GLTF resources to the GPU
-      {
-        nvsamples::importGltfData(m_sceneResource, teapotModel, m_stagingUploader);  // Import the GLTF resources
-        nvsamples::importGltfData(m_sceneResource, planeModel, m_stagingUploader);   // Import the GLTF resources
-      }
+      LOGI("Loaded Cornell Box: %zu meshes, %zu instances\n", m_sceneResource.meshes.size(), m_sceneResource.instances.size());
     }
 
-
+    // Cornell Box materials HARDCODED to match gltf file
     m_sceneResource.materials = {
-        // Teapot material
-        {.baseColorFactor = glm::vec4(0.8f, 1.0f, 0.6f, 1.0f), .metallicFactor = 0.5f, .roughnessFactor = 0.5f},
-        // Plane material with texture
-        {.baseColorFactor = glm::vec4(1.0f, 1.0f, 1.0f, 1.0f), .metallicFactor = 0.1f, .roughnessFactor = 0.8f, .baseColorTextureIndex = 0}};
+        // Material 0: White/Gray, DEFAULT for meshes without material (was Material.002)
+        {.baseColorFactor = glm::vec4(0.800000011920929f, 0.800000011920929f, 0.800000011920929f, 1.0f),
+         .metallicFactor  = 0.0f,
+         .roughnessFactor = 0.5f},
 
+        // Material 1: Blue wall (was Material.004)
+        {.baseColorFactor = glm::vec4(0.0008601927547715604f, 0.0f, 0.604628324508667f, 1.0f), .metallicFactor = 0.0f, .roughnessFactor = 0.5f},
 
-    m_sceneResource.instances = {
-        // Teapot
-        {.transform     = glm::translate(glm::mat4(1), glm::vec3(0, 0, 0)) * glm::scale(glm::mat4(1), glm::vec3(0.5f)),
-         .materialIndex = 0,
-         .meshIndex     = 0},
-        // Plane
-        {.transform = glm::scale(glm::translate(glm::mat4(1), glm::vec3(0, -0.9f, 0)), glm::vec3(2.f)), .materialIndex = 1, .meshIndex = 1},
+        // Material 2: Red wall (was Material.003)
+        {.baseColorFactor = glm::vec4(0.6870272159576416f, 0.0f, 0.0f, 1.0f), .metallicFactor = 0.0f, .roughnessFactor = 0.5f},
+
+        // Material 3: Mirror ball
+        {.baseColorFactor = glm::vec4(1.0f, 1.0f, 1.0f, 1.0f),
+         .metallicFactor  = 1.0f,   // Fully metallic for reflecting all incoming light rays
+         .roughnessFactor = 0.0f},  // Perfectly smooth mirror for sharp, directional reflection
     };
 
+    // Based on the GLB: mesh 1->blue, mesh 3->red, mesh 4->white
+    for(auto& instance : m_sceneResource.instances)
+    {
+      uint32_t meshIdx = instance.meshIndex;
 
-    nvsamples::createGltfSceneInfoBuffer(m_sceneResource, m_stagingUploader);  // Create buffers for the scene data (GPU buffers)
+      if(meshIdx == 1)
+        instance.materialIndex = 1;  // Blue wall (Cube.003)
+      else if(meshIdx == 3)
+        instance.materialIndex = 2;  // Red wall (Cube.005)
+      else if(meshIdx == 4)
+        instance.materialIndex = 0;  // White (Cube.006)
+      else if(meshIdx == 7)
+        instance.materialIndex = 3;  // Mirror ball (Icosphere.001)
+      else
+        instance.materialIndex = 0;  // Default white for others
+    }
 
-    m_stagingUploader.cmdUploadAppended(cmd);  // Upload the scene information to the GPU
+    nvsamples::createGltfSceneInfoBuffer(m_sceneResource, m_stagingUploader);
+    m_stagingUploader.cmdUploadAppended(cmd);
 
-    // Scene information
     shaderio::GltfSceneInfo& sceneInfo = m_sceneResource.sceneInfo;
-    sceneInfo.useSky                   = false;                                         // Use light
-    sceneInfo.instances = (shaderio::GltfInstance*)m_sceneResource.bInstances.address;  // Address of the instance buffer
-    sceneInfo.meshes = (shaderio::GltfMesh*)m_sceneResource.bMeshes.address;            // Address of the mesh buffer
-    sceneInfo.materials = (shaderio::GltfMetallicRoughness*)m_sceneResource.bMaterials.address;  // Address of the material buffer
-    sceneInfo.backgroundColor             = {0.85f, 0.85f, 0.85f};                               // The background color
+    sceneInfo.useSky                   = false;
+    sceneInfo.instances                = (shaderio::GltfInstance*)m_sceneResource.bInstances.address;
+    sceneInfo.meshes                   = (shaderio::GltfMesh*)m_sceneResource.bMeshes.address;
+    sceneInfo.materials                = (shaderio::GltfMetallicRoughness*)m_sceneResource.bMaterials.address;
+    sceneInfo.backgroundColor          = {0.0f, 0.0f, 0.0f};  
+
+    // Light positioned inside box at the top
     sceneInfo.numLights                   = 1;
     sceneInfo.punctualLights[0].color     = glm::vec3(1.0f, 1.0f, 1.0f);
-    sceneInfo.punctualLights[0].intensity = 4.0f;
-    sceneInfo.punctualLights[0].position  = glm::vec3(1.0f, 1.0f, 1.0f);  // Position of the light
-    sceneInfo.punctualLights[0].direction = glm::vec3(1.0f, 1.0f, 1.0f);  // Direction to the light
+    sceneInfo.punctualLights[0].intensity = 55.0f;                       
+    sceneInfo.punctualLights[0].position  = glm::vec3(0.0f, 12.0f, -2.0f);   // near ceiling little towards the back
+    sceneInfo.punctualLights[0].direction = glm::vec3(0.0f, -1.0f, 0.0f);  // Pointing down
     sceneInfo.punctualLights[0].type      = shaderio::GltfLightType::ePoint;
-    sceneInfo.punctualLights[0].coneAngle = 0.9f;  // Cone angle for spot lights (0 for point and directional lights)
+    sceneInfo.punctualLights[0].coneAngle = 0.9f;
 
-    m_app->submitAndWaitTempCmdBuffer(cmd);  // Submit the command buffer to upload the resources
+    m_app->submitAndWaitTempCmdBuffer(cmd);
 
-    // Default camera
+    // Camera positioned outside the box looking in
     m_cameraManip->setClipPlanes({0.01F, 100.0F});
-    m_cameraManip->setLookat({0.0F, 0.5F, 5.0}, {0.F, 0.F, 0.F}, {0.0F, 1.0F, 0.0F});
+    m_cameraManip->setLookat({-0.843F, 9.481F, -23.78F},   // Camera position - outside and in front of box
+                             {-1.096F, 8.839F, -17.985F},   // Look at center of box
+                             {0.0F, 1.0F, 0.0F});  // Up vector
   }
 
 
@@ -996,17 +1031,424 @@ private:
 
   shaderio::TutoPushConstant m_pushValues{};  // Push constant values used to pass data to the shaders
 
-  // Photon Mapping Components
+  // Photon Mapping 
   nvvk::Buffer m_photonBuffer;          // Storage for photons
-  uint32_t     m_maxPhotons = 1000000;  // Max photons we can store
+  uint32_t     m_maxPhotons = 10000000;  // Max photons we can store. HARDCODED VALUE IN SHADER TO MATCH.
   nvvk::Buffer m_photonCounterBuffer;   // Atomic counter for photon storage
 
-  bool m_usePhotonMapping  = false;  // Toggle in UI
-  int  m_photonsPerLight   = 10000;  // Photons to trace
-  int  m_photonGatherCount = 50;     // K-nearest for gathering
+  // Adjustable UI values
+  bool m_usePhotonMapping  = false;  
+  int  m_photonsPerLight   = 10000;  
+  float m_photonGatherRadius = 0.01;  
+  
+  /// <summary>
+  /// Octree vars
+  /// </summary>
+  std::vector<shaderio::OctreeNode> m_octreeNodes;
+  shaderio::PhotonOctree            m_octreeParams;
+  nvvk::Buffer                      m_octreeBuffer;
+  nvvk::Buffer                      m_octreeParamsBuffer;
 
-  VkStridedDeviceAddressRegionKHR m_photonRaygenRegion{};  // NEW: For photon tracing
+  // CPU-side photon data for octree building
+  std::vector<shaderio::Photon> m_cpuPhotons;
+  std::vector<shaderio::Photon> m_reorderedPhotons;  
+  bool                          m_photonDataReady = false;
 
+  /// <summary>
+  /// Cache the current light state to recalc photon map if its changed
+  /// </summary>
+  bool      m_photonsCached = false;
+  glm::vec3 m_lastLightPosition{0, 0, 0};
+  float     m_lastLightIntensity = 0;
+  bool m_needOctreeRebuild = false;
+
+  /// <summary>
+  /// Manual trigger to retrace photon map
+  /// </summary>
+  bool m_retracePM = false;
+
+  VkStridedDeviceAddressRegionKHR m_photonRaygenRegion{};  
+
+
+  void readPhotonsFromGPU()
+  {
+    SCOPED_TIMER(__FUNCTION__);
+
+    VkCommandBuffer cmd = m_app->createTempCmdBuffer();
+
+    // Create staging buffer for counter (CPU-accessible)
+    nvvk::Buffer stagingCounterBuffer;
+    NVVK_CHECK(m_allocator.createBuffer(stagingCounterBuffer, sizeof(uint32_t), VK_BUFFER_USAGE_2_TRANSFER_DST_BIT, VMA_MEMORY_USAGE_AUTO_PREFER_HOST,
+                                        VMA_ALLOCATION_CREATE_MAPPED_BIT | VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT));
+
+    // Copy COUNTER from device to staging
+    VkBufferCopy copyRegion{.srcOffset = 0, .dstOffset = 0, .size = sizeof(uint32_t)};
+    vkCmdCopyBuffer(cmd, m_photonCounterBuffer.buffer, stagingCounterBuffer.buffer, 1, &copyRegion);
+
+    nvvk::cmdBufferMemoryBarrier(cmd, {stagingCounterBuffer.buffer, VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_PIPELINE_STAGE_2_HOST_BIT});
+
+    m_app->submitAndWaitTempCmdBuffer(cmd);
+
+    // Read photon count
+    uint32_t photonCount = 0;
+    memcpy(&photonCount, stagingCounterBuffer.mapping, sizeof(uint32_t));
+
+    if(photonCount == 0)
+    {
+      LOGI("No photons traced\n");
+      m_allocator.destroyBuffer(stagingCounterBuffer);
+      m_photonDataReady = false;
+      m_cpuPhotons.clear();
+      return;
+    }
+
+    LOGI("Reading %u photons from GPU...\n", photonCount);
+
+    // Create staging buffer for photon data
+    cmd = m_app->createTempCmdBuffer();
+
+    VkDeviceSize photonDataSize = sizeof(shaderio::Photon) * photonCount;
+    nvvk::Buffer stagingPhotonBuffer;
+    NVVK_CHECK(m_allocator.createBuffer(stagingPhotonBuffer, photonDataSize, VK_BUFFER_USAGE_2_TRANSFER_DST_BIT, VMA_MEMORY_USAGE_AUTO_PREFER_HOST,
+                                        VMA_ALLOCATION_CREATE_MAPPED_BIT | VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT));
+
+    // Copy ACTUAL PHOTON data from device to staging
+    VkBufferCopy photonCopy{.srcOffset = 0, .dstOffset = 0, .size = photonDataSize};
+    vkCmdCopyBuffer(cmd, m_photonBuffer.buffer, stagingPhotonBuffer.buffer, 1, &photonCopy);
+
+    nvvk::cmdBufferMemoryBarrier(cmd, {stagingPhotonBuffer.buffer, VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_PIPELINE_STAGE_2_HOST_BIT});
+
+    m_app->submitAndWaitTempCmdBuffer(cmd);
+
+    // Allocate CPU vector for photon count (read from GPU counter staging buffer earlier)
+    // then copy actual photon data from seperate GPU staging buffer
+    m_cpuPhotons.resize(photonCount);
+    memcpy(m_cpuPhotons.data(), stagingPhotonBuffer.mapping, photonDataSize);
+
+    LOGI("Successfully read %zu photons to CPU\n", m_cpuPhotons.size());
+
+    // Cleanup staging buffers
+    m_allocator.destroyBuffer(stagingCounterBuffer);
+    m_allocator.destroyBuffer(stagingPhotonBuffer);
+
+    m_photonDataReady = true;
+  }
+
+void buildPhotonOctree()
+  {
+    SCOPED_TIMER(__FUNCTION__);
+
+    if(!m_photonDataReady || m_cpuPhotons.empty())
+    {
+      LOGI("No photons available to build octree\n");
+      return;
+    }
+
+    LOGI("Building octree with %zu photons...\n", m_cpuPhotons.size());
+
+    // Find bounds for any real vertex position
+    glm::vec3 minBound(FLT_MAX);
+    glm::vec3 maxBound(-FLT_MAX);
+
+    for(const auto& p : m_cpuPhotons)
+    {
+      minBound = glm::min(minBound, p.position);
+      maxBound = glm::max(maxBound, p.position);
+    }
+
+    // Add padding to bounds
+    glm::vec3 padding = (maxBound - minBound) * 0.01f;
+    minBound -= padding;
+    maxBound += padding;
+
+    // Make bounds cubic (same size in all dimensions)
+    glm::vec3 size    = maxBound - minBound;
+    float     maxSize = glm::max(glm::max(size.x, size.y), size.z);
+    glm::vec3 center  = (minBound + maxBound) * 0.5f;
+    minBound          = center - glm::vec3(maxSize * 0.5f);
+    maxBound          = center + glm::vec3(maxSize * 0.5f);
+
+    // Store octree parameters
+    m_octreeParams.minBound = minBound;
+    m_octreeParams.maxBound = maxBound;
+    m_octreeParams.maxDepth = 8;  // Adjust based on photon count. HARDCODED
+
+    // Show first 10 REORDERED photon positions
+    //LOGI("First 10 REORDERED photon positions:\n");
+    //for(size_t i = 0; i < std::min(size_t(10), m_reorderedPhotons.size()); i++)
+    //{
+    //  const auto& p = m_reorderedPhotons[i];
+    //  LOGI("  Reordered[%zu]: pos=(%.2f, %.2f, %.2f)\n", i, p.position.x, p.position.y, p.position.z);
+    //}
+
+    // Show first 10 NON-EMPTY leaves with DEPTH
+    //LOGI("\nFirst 10 NON-EMPTY leaf nodes:\n");
+    //int leafCount = 0;
+    //for(size_t i = 0; i < m_octreeNodes.size() && leafCount < 10; i++)
+    //{
+    //  const auto& n = m_octreeNodes[i];
+    //  if(n.childIndex == 0 && n.photonCount > 0)
+    //  {
+    //    LOGI("  Node %zu: photonStart=%u, photonCount=%u, center=(%.2f,%.2f,%.2f), halfSize=%.2f\n", i, n.photonStart,
+    //         n.photonCount, n.center.x, n.center.y, n.center.z, n.halfSize);
+
+    //    // Show first photon in this leaf
+    //    const auto& firstPhoton = m_reorderedPhotons[n.photonStart];
+    //    LOGI("    First photon in leaf: pos=(%.2f, %.2f, %.2f)\n", firstPhoton.position.x, firstPhoton.position.y,
+    //         firstPhoton.position.z);
+
+    //    leafCount++;
+    //  }
+    //}
+
+    // Build octree recursively
+    m_octreeNodes.clear();
+    m_reorderedPhotons.clear();  // clear reordered buffer
+
+    std::vector<uint32_t> photonIndices(m_cpuPhotons.size());
+    for(uint32_t i = 0; i < m_cpuPhotons.size(); i++)
+    {
+      photonIndices[i] = i;
+    }
+
+    glm::vec3 rootCenter   = (minBound + maxBound) * 0.5f;
+    float     rootHalfSize = maxSize * 0.5f;
+
+    buildOctreeRecursive(rootCenter, rootHalfSize, photonIndices, 0);
+
+    m_octreeParams.nodeCount = m_octreeNodes.size();
+
+    LOGI("Octree built: %zu nodes, depth %u\n", m_octreeNodes.size(), m_octreeParams.maxDepth);
+   // LOGI("Reordered photons: %zu (should match original %zu)\n", m_reorderedPhotons.size(), m_cpuPhotons.size());
+
+      m_octreeParams.nodeCount = m_octreeNodes.size();
+
+      // In buildPhotonOctree(), replace the diagnostic section with:
+      //LOGI("=== OCTREE DEBUG INFO ===\n");
+      //LOGI("Total nodes: %zu\n", m_octreeNodes.size());
+      //LOGI("Original photons: %zu\n", m_cpuPhotons.size());
+      //LOGI("Reordered photons: %zu\n", m_reorderedPhotons.size());
+
+      // Count leaf vs internal nodes
+      //int leafNodes     = 0;
+      //int internalNodes = 0;
+      //int emptyLeaves   = 0;
+
+      //for(const auto& node : m_octreeNodes)
+      //{
+      //  if(node.childIndex == 0)
+      //  {
+      //    leafNodes++;
+      //    if(node.photonCount == 0)
+      //      emptyLeaves++;
+      //  }
+      //  else
+      //  {
+      //    internalNodes++;
+      //  }
+      //}
+
+    uploadReorderedPhotons();
+    uploadOctree();
+  
+  }
+
+  void uploadReorderedPhotons()
+  {
+    if(m_reorderedPhotons.empty())
+      return;
+    
+    VkCommandBuffer cmd = m_app->createTempCmdBuffer();
+
+    VkDeviceSize photonDataSize = sizeof(shaderio::Photon) * m_reorderedPhotons.size();
+
+    // Upload reordered photons to the SAME photon buffer
+    NVVK_CHECK(m_stagingUploader.appendBuffer(m_photonBuffer,
+                                              0,  // Offset 0 - overwrite original traced photons
+                                              std::span<shaderio::Photon>(m_reorderedPhotons)));
+
+    m_stagingUploader.cmdUploadAppended(cmd);
+    m_app->submitAndWaitTempCmdBuffer(cmd);
+
+    LOGI("Uploaded %zu reordered photons to GPU (%.2f KB)\n", m_reorderedPhotons.size(), photonDataSize / 1024.0f);
+  }
+
+
+  void createEmptyOctreeBuffers()
+  {
+    SCOPED_TIMER(__FUNCTION__);
+
+    VkCommandBuffer cmd = m_app->createTempCmdBuffer();
+
+    // Create minimal octree nodes buffer (single empty node)
+    shaderio::OctreeNode emptyNode{};
+    NVVK_CHECK(m_allocator.createBuffer(m_octreeBuffer, sizeof(shaderio::OctreeNode),
+                                        VK_BUFFER_USAGE_2_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_2_SHADER_DEVICE_ADDRESS_BIT
+                                            | VK_BUFFER_USAGE_2_TRANSFER_DST_BIT,
+                                        VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE));
+    NVVK_DBG_NAME(m_octreeBuffer.buffer);
+
+    // Create octree params buffer with zero count
+    shaderio::PhotonOctree emptyParams{};
+    emptyParams.nodeCount = 0;  // Shader will skip octree if nodeCount == 0
+    NVVK_CHECK(m_allocator.createBuffer(m_octreeParamsBuffer, sizeof(shaderio::PhotonOctree),
+                                        VK_BUFFER_USAGE_2_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_2_SHADER_DEVICE_ADDRESS_BIT
+                                            | VK_BUFFER_USAGE_2_TRANSFER_DST_BIT,
+                                        VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE));
+    NVVK_DBG_NAME(m_octreeParamsBuffer.buffer);
+
+    // Upload empty data
+    NVVK_CHECK(m_stagingUploader.appendBuffer(m_octreeBuffer, 0, std::span<shaderio::OctreeNode>(&emptyNode, 1)));
+    NVVK_CHECK(m_stagingUploader.appendBuffer(m_octreeParamsBuffer, 0, std::span<shaderio::PhotonOctree>(&emptyParams, 1)));
+
+    m_stagingUploader.cmdUploadAppended(cmd);
+    m_app->submitAndWaitTempCmdBuffer(cmd);
+
+    LOGI("Empty octree buffers created\n");
+  }
+
+uint32_t buildOctreeRecursive(const glm::vec3& center, float halfSize, std::vector<uint32_t>& photonIndices, uint32_t depth)
+  {
+    // Create node
+    uint32_t             nodeIndex = m_octreeNodes.size();
+    shaderio::OctreeNode node{};
+    node.center      = center;
+    node.halfSize    = halfSize;
+    node.photonCount = photonIndices.size();
+    node.childIndex  = 0;
+    node.photonStart = 0;
+    m_octreeNodes.push_back(node);
+
+    // Leaf node conditions
+    const uint32_t MAX_PHOTONS_PER_LEAF = 32; // HARDCODED
+    if(photonIndices.size() <= MAX_PHOTONS_PER_LEAF || depth >= m_octreeParams.maxDepth)
+    {
+      // REORDERING HAPPENS HERE FOR CONTIGUOUS MEMORY, close photons next to eachother in memory
+      // Allows for sequential access of photonBuffer on GPU, so nodes need only photonstart and photoncount
+      // 
+      // WE ACCESS PHOTONBUFFER ON GPU VIA INDICES STORED IN OCTREE NODE TO BE EFFICENT!!!
+      uint32_t photonStart = m_reorderedPhotons.size();
+
+      // Append photons in TREE TRAVERSAL order 
+      for(uint32_t idx : photonIndices)
+      {
+        m_reorderedPhotons.push_back(m_cpuPhotons[idx]);
+      }
+
+      m_octreeNodes[nodeIndex].childIndex  = 0;
+      m_octreeNodes[nodeIndex].photonStart = photonStart;
+      m_octreeNodes[nodeIndex].photonCount = photonIndices.size();
+
+      return nodeIndex;
+    }
+
+    // Split into 8 octants
+    std::vector<std::vector<uint32_t>> octants(8);
+
+    for(uint32_t idx : photonIndices)
+    {
+      const shaderio::Photon& p = m_cpuPhotons[idx];
+
+      int octant = 0;
+      if(p.position.x >= center.x)
+        octant |= 1;
+      if(p.position.y >= center.y)
+        octant |= 2;
+      if(p.position.z >= center.z)
+        octant |= 4;
+
+      octants[octant].push_back(idx);
+    }
+
+    // PRE-ALLOCATE all 8 child slots to make them consecutive
+    uint32_t firstChildIndex            = m_octreeNodes.size();
+    m_octreeNodes[nodeIndex].childIndex = firstChildIndex;
+
+    // Reserve 8 slots
+    for(int i = 0; i < 8; i++)
+    {
+      shaderio::OctreeNode placeholder{};
+      m_octreeNodes.push_back(placeholder);
+    }
+
+    // Now fill in each child slot
+    float childHalfSize = halfSize * 0.5f;
+
+    for(int i = 0; i < 8; i++)
+    {
+      glm::vec3 childCenter = center
+                              + glm::vec3((i & 1) ? childHalfSize : -childHalfSize, (i & 2) ? childHalfSize : -childHalfSize,
+                                          (i & 4) ? childHalfSize : -childHalfSize);
+
+      if(octants[i].empty())
+      {
+        // Fill in empty child at reserved slot
+        m_octreeNodes[firstChildIndex + i].center      = childCenter;
+        m_octreeNodes[firstChildIndex + i].halfSize    = childHalfSize;
+        m_octreeNodes[firstChildIndex + i].childIndex  = 0;
+        m_octreeNodes[firstChildIndex + i].photonCount = 0;
+        m_octreeNodes[firstChildIndex + i].photonStart = 0;
+      }
+      else
+      {
+        // Build subtree, store root at reserved slot
+        uint32_t subtreeRoot = buildOctreeRecursive(childCenter, childHalfSize, octants[i], depth + 1);
+        // Copy subtree root data into the reserved slot
+        m_octreeNodes[firstChildIndex + i] = m_octreeNodes[subtreeRoot];
+        // Mark old location as invalid (we could reuse this space later)
+      }
+    }
+
+    return nodeIndex;
+  }
+
+ void uploadOctree()
+  {
+    if(m_octreeNodes.empty())
+    {
+      LOGI("Octree is empty, keeping empty buffers\n");
+      return;
+    }
+    vkDeviceWaitIdle(m_app->getDevice());  
+
+    VkCommandBuffer cmd = m_app->createTempCmdBuffer();
+
+    // Destroy old buffers safely
+    if(m_octreeBuffer.buffer != VK_NULL_HANDLE)
+    {
+      m_allocator.destroyBuffer(m_octreeBuffer);
+      m_octreeBuffer = {};  // Clear the struct
+    }
+    if(m_octreeParamsBuffer.buffer != VK_NULL_HANDLE)
+    {
+      m_allocator.destroyBuffer(m_octreeParamsBuffer);
+      m_octreeParamsBuffer = {};  // Clear the struct
+    }
+
+    // Create NEW octree nodes buffer
+    VkDeviceSize nodesSize = sizeof(shaderio::OctreeNode) * m_octreeNodes.size();
+    NVVK_CHECK(m_allocator.createBuffer(m_octreeBuffer, nodesSize,
+                                        VK_BUFFER_USAGE_2_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_2_SHADER_DEVICE_ADDRESS_BIT
+                                            | VK_BUFFER_USAGE_2_TRANSFER_DST_BIT,
+                                        VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE));
+    NVVK_DBG_NAME(m_octreeBuffer.buffer);
+
+    // Create NEW octree params buffer
+    NVVK_CHECK(m_allocator.createBuffer(m_octreeParamsBuffer, sizeof(shaderio::PhotonOctree),
+                                        VK_BUFFER_USAGE_2_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_2_SHADER_DEVICE_ADDRESS_BIT
+                                            | VK_BUFFER_USAGE_2_TRANSFER_DST_BIT,
+                                        VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE));
+    NVVK_DBG_NAME(m_octreeParamsBuffer.buffer);
+
+    // Upload octree to GPU buffer
+    NVVK_CHECK(m_stagingUploader.appendBuffer(m_octreeBuffer, 0, std::span<shaderio::OctreeNode>(m_octreeNodes)));
+    NVVK_CHECK(m_stagingUploader.appendBuffer(m_octreeParamsBuffer, 0, std::span<shaderio::PhotonOctree>(&m_octreeParams, 1)));
+
+    m_stagingUploader.cmdUploadAppended(cmd);
+    m_app->submitAndWaitTempCmdBuffer(cmd);
+
+    LOGI("Octree uploaded to GPU: %zu nodes (%.2f KB)\n", m_octreeNodes.size(), nodesSize / 1024.0f);
+  }
 
   void createPhotonBuffers()
   {
@@ -1016,13 +1458,15 @@ private:
 
     // Create photon storage buffer
     NVVK_CHECK(m_allocator.createBuffer(m_photonBuffer, sizeof(shaderio::Photon) * m_maxPhotons,
-                                        VK_BUFFER_USAGE_2_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_2_SHADER_DEVICE_ADDRESS_BIT,
+                                        VK_BUFFER_USAGE_2_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_2_SHADER_DEVICE_ADDRESS_BIT
+                                            | VK_BUFFER_USAGE_2_TRANSFER_SRC_BIT, // needed for copy to cpu
                                         VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE));
     NVVK_DBG_NAME(m_photonBuffer.buffer);
 
     // Create counter buffer (single uint32_t) needs to be modified by shader thus using storage buffer
     NVVK_CHECK(m_allocator.createBuffer(m_photonCounterBuffer, sizeof(uint32_t),
-                                        VK_BUFFER_USAGE_2_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_2_TRANSFER_DST_BIT | VK_BUFFER_USAGE_2_SHADER_DEVICE_ADDRESS_BIT,
+                                        VK_BUFFER_USAGE_2_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_2_TRANSFER_DST_BIT
+                                            | VK_BUFFER_USAGE_2_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_2_TRANSFER_SRC_BIT,
                                         VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE));
     NVVK_DBG_NAME(m_photonCounterBuffer.buffer);
 
@@ -1034,6 +1478,9 @@ private:
     LOGI("Photon buffers created (max: %d photons)\n", m_maxPhotons);
   }
 
+  /// <summary>
+  /// Tells GPU to get to tracing photons with a clean buffer and new push const settings provided.
+  /// </summary>
   void tracePhotons(VkCommandBuffer cmd)
   {
     NVVK_DBG_SCOPE(cmd);
@@ -1069,6 +1516,8 @@ private:
                  VK_IMAGE_LAYOUT_GENERAL);  
     write.append(m_rtDescPack.makeWrite(shaderio::BindingPoints::ePhotonBuffer), m_photonBuffer);
     write.append(m_rtDescPack.makeWrite(shaderio::BindingPoints::ePhotonCounter), m_photonCounterBuffer);
+    write.append(m_rtDescPack.makeWrite(shaderio::BindingPoints::eOctreeNodes), m_octreeBuffer);
+    write.append(m_rtDescPack.makeWrite(shaderio::BindingPoints::eOctreeParams), m_octreeParamsBuffer);  
 
     vkCmdPushDescriptorSetKHR(cmd, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR, m_rtPipelineLayout, 1, write.size(), write.data());
 
@@ -1212,6 +1661,18 @@ void createShaderBindingTable(const VkRayTracingPipelineCreateInfoKHR& rtPipelin
                          .descriptorCount = 1,
                          .stageFlags      = VK_SHADER_STAGE_ALL});
 
+    // octree bindings
+    bindings.addBinding({.binding         = shaderio::BindingPoints::eOctreeNodes,
+                         .descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                         .descriptorCount = 1,
+                         .stageFlags      = VK_SHADER_STAGE_ALL});
+
+    bindings.addBinding({.binding         = shaderio::BindingPoints::eOctreeParams,
+                         .descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                         .descriptorCount = 1,
+                         .stageFlags      = VK_SHADER_STAGE_ALL});
+  
+
     // Creating a PUSH descriptor set and set layout from the bindings
     m_rtDescPack.init(bindings, m_app->getDevice(), 0, VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR);
 
@@ -1331,17 +1792,41 @@ void createShaderBindingTable(const VkRayTracingPipelineCreateInfoKHR& rtPipelin
     createShaderBindingTable(rtPipelineInfo);
   }
 
-  void raytraceScene(VkCommandBuffer cmd)
+void raytraceScene(VkCommandBuffer cmd)
   {
-    NVVK_DBG_SCOPE(cmd);  // <-- Helps to debug in NSight
+    NVVK_DBG_SCOPE(cmd);
 
-      // PASS 1: Trace Photons 
-    if(m_usePhotonMapping)
+    // Check if we need to rebuild photons
+    //auto& light = m_sceneResource.sceneInfo.punctualLights[0];
+
+    //bool lightChanged = !m_photonsCached || glm::length(m_lastLightPosition - light.position) > 0.001f
+    //                    || std::abs(m_lastLightIntensity - light.intensity) > 0.001f;
+
+    // ONLY trace photons if using photon mapping and a trace has been 
+    // prompted via button press
+    if(m_usePhotonMapping && m_retracePM)
     {
+      LOGI(" Tracing %d photons...\n", m_photonsPerLight);
+
+      // GPU CREATES photons 
       tracePhotons(cmd);
+
+      // prompt octree to be rebuilt with newly traced photons before next frame
+      m_needOctreeRebuild = true;
+      m_photonDataReady = false;
+
+      // reset button
+      m_retracePM = false;
+
+      //m_photonsCached      = true;
+      //m_lastLightPosition  = light.position;
+      //m_lastLightIntensity = light.intensity;
+      
+
+      LOGI(" Photons cached - will reuse until light changes\n");
     }
 
-    // Ray trace pipeline
+    // PASS 2: Camera rays (runs every frame using cached photons)
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR, m_rtPipeline);
 
     // Bind the descriptor sets for the graphics pipeline (making textures available to the shaders)
@@ -1358,21 +1843,20 @@ void createShaderBindingTable(const VkRayTracingPipelineCreateInfoKHR& rtPipelin
     write.append(m_rtDescPack.makeWrite(shaderio::BindingPoints::eTlas), m_tlasAccel);
     write.append(m_rtDescPack.makeWrite(shaderio::BindingPoints::eOutImage), m_gBuffers.getColorImageView(eImgRendered),
                  VK_IMAGE_LAYOUT_GENERAL);
-
     write.append(m_rtDescPack.makeWrite(shaderio::BindingPoints::ePhotonBuffer), m_photonBuffer);
     write.append(m_rtDescPack.makeWrite(shaderio::BindingPoints::ePhotonCounter), m_photonCounterBuffer);
-
-
+    write.append(m_rtDescPack.makeWrite(shaderio::BindingPoints::eOctreeNodes), m_octreeBuffer);
+    write.append(m_rtDescPack.makeWrite(shaderio::BindingPoints::eOctreeParams), m_octreeParamsBuffer);
 
     vkCmdPushDescriptorSetKHR(cmd, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR, m_rtPipelineLayout, 1, write.size(), write.data());
 
     // Push constant information
     shaderio::TutoPushConstant pushValues{
-        .sceneInfoAddress = (shaderio::GltfSceneInfo*)m_sceneResource.bSceneInfo.address,
-        .depthMax = m_pushValues.depthMax,
-        .usePhotonMapping  = m_usePhotonMapping ? 1 : 0,  
-        .photonsPerLight   = m_photonsPerLight,           
-        .photonGatherCount = m_photonGatherCount,         
+        .sceneInfoAddress  = (shaderio::GltfSceneInfo*)m_sceneResource.bSceneInfo.address,
+        .depthMax          = m_pushValues.depthMax,
+        .usePhotonMapping  = m_usePhotonMapping ? 1 : 0,
+        .photonsPerLight   = m_photonsPerLight,
+        .photonGatherRadius = m_photonGatherRadius,
     };
     const VkPushConstantsInfo pushInfo{.sType      = VK_STRUCTURE_TYPE_PUSH_CONSTANTS_INFO,
                                        .layout     = m_rtPipelineLayout,

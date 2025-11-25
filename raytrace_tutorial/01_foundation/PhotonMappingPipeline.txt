@@ -1,0 +1,60 @@
+﻿┌─────────────────────────────────────────────────────────────┐
+│ FRAME START                                                 │
+└─────────────────────────────────────────────────────────────┘
+                            │
+                            ▼
+┌─────────────────────────────────────────────────────────────┐
+│ 1. CPU → GPU: Empty Buffers                                │
+│    - createPhotonBuffers() once at startup                 │
+│    - tracePhotons() clears buffers each retrace            │
+│    • m_photonBuffer (10M photons, zeroed)                  │
+│    • m_photonCounterBuffer (0)                             │
+└─────────────────────────────────────────────────────────────┘
+                            │
+                            ▼
+┌─────────────────────────────────────────────────────────────┐
+│ 2. GPU FILLS: Photon Tracing (tracePhotons())             │
+│    - photonRayGen() shader launches grid of photons        │
+│    - rchitMain() stores photons at hit points              │
+│    - InterlockedAdd() atomically increments counter        │
+│    Result: m_photonBuffer filled with ~4-5M photons        │
+└─────────────────────────────────────────────────────────────┘
+                            │
+                            ▼
+┌─────────────────────────────────────────────────────────────┐
+│ 3. GPU → CPU: Read Back (readPhotonsFromGPU())            │
+│    - Copy m_photonCounterBuffer to staging → read count   │
+│    - Copy m_photonBuffer to staging → m_cpuPhotons[]      │
+│    Result: CPU has all photon data in RAM                  │
+└─────────────────────────────────────────────────────────────┘
+                            │
+                            ▼
+┌─────────────────────────────────────────────────────────────┐
+│ 4. CPU BUILDS: Octree Construction (buildPhotonOctree())  │
+│    - buildOctreeRecursive() creates spatial tree           │
+│    - Spatially reorders photons for cache coherency        │
+│    Result:                                                  │
+│    • m_octreeNodes[] - tree structure                      │
+│    • m_reorderedPhotons[] - spatially sorted photons       │
+└─────────────────────────────────────────────────────────────┘
+                            │
+                            ▼
+┌─────────────────────────────────────────────────────────────┐
+│ 5. CPU → GPU: Upload Octree (uploadOctree())              │
+│    - Upload m_octreeNodes → m_octreeBuffer                 │
+│    - Upload m_octreeParams → m_octreeParamsBuffer          │
+│    - Upload m_reorderedPhotons → m_photonBuffer (OVERWRITES!)│
+│    Result: GPU has spatial acceleration structure          │
+└─────────────────────────────────────────────────────────────┘
+                            │
+                            ▼
+┌─────────────────────────────────────────────────────────────┐
+│ 6. GPU USES: Efficient Gathering (gatherPhotonsOctree())  │
+│    - Camera rays call gatherPhotonsOctree()                │
+│    - Stack-based octree traversal                          │
+│    - AABB culling skips distant nodes                      │
+│    - Only visits nearby photons                            │
+│    Result: Fast O(log N) search instead of O(N) brute force│
+└─────────────────────────────────────────────────────────────┘
+
+   WE ACCESS REORDERED PHOTONBUFFER ON GPU VIA INDICES STORED IN OCTREE NODE TO BE EFFICENT!!!

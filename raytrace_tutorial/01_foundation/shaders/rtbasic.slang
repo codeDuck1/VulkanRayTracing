@@ -26,6 +26,13 @@
 [[vk::binding(BindingPoints::ePhotonBuffer, 1)]]  RWStructuredBuffer<Photon> photonBuffer;
 [[vk::binding(BindingPoints::ePhotonCounter, 1)]] RWStructuredBuffer<uint> photonCounter;
 
+
+[[vk::binding(BindingPoints::eOctreeNodes, 1)]]  
+RWStructuredBuffer<OctreeNode> octreeNodes;
+[[vk::binding(BindingPoints::eOctreeParams, 1)]] 
+RWStructuredBuffer<PhotonOctree> octreeParams;
+
+
 // clang-format on
 
 // Ray payload structure - carries data through the ray tracing pipeline
@@ -210,7 +217,7 @@ float3 unpackRGB9E5(uint packed)
   return float3(float(r), float(g), float(b)) * scale;
 }
 
-// Generate random direction in hemisphere around normal
+// Generate random direction on hemisphere around normal
 float3 randomHemisphere(float3 normal, inout RandomState rng)
 {
   float z = randomFloat(rng);
@@ -227,43 +234,75 @@ float3 randomHemisphere(float3 normal, inout RandomState rng)
   return normalize(tangent * dir.x + bitangent * dir.y + normal * dir.z);
 }
 
-// Gather photons at a point (brute force for now)
-float3 gatherPhotons(float3 worldPos, float3 worldNormal)
+
+// GPU octree spatial accelerated photon gathering
+float3 gatherPhotonsOctree(float3 worldPos, float3 worldNormal)
 {
   if(pushConst.usePhotonMapping == 0)
     return float3(0, 0, 0);
   
-  float3 irradiance = float3(0, 0, 0);
-  float gatherRadius = 0.3;
+  PhotonOctree octree = octreeParams[0];
+  if(octree.nodeCount == 0)
+    return float3(0, 0, 0);
   
-  uint totalPhotons = photonCounter[0];
+  float3 irradiance = float3(0, 0, 0);
+  float gatherRadius = pushConst.photonGatherRadius;  // Tune based on scene size (0.1-0.5)
   uint photonsFound = 0;
   
-  // Stop early once we find enough photons
-  const uint MAX_SEARCH = min(totalPhotons, 50000u); // Don't search more than 50k
+  // Stack-based iterative traversal (avoids GPU recursion)
+  uint stack[256];
+  int stackPtr = 0;
+  stack[stackPtr++] = 0;  // Start with root node
   
-  for(uint i = 0; i < MAX_SEARCH; i++)  // CHANGED: was totalPhotons
+  while(stackPtr > 0)
   {
-    Photon p = photonBuffer[i];
+    uint nodeIdx = stack[--stackPtr];
+    if(nodeIdx >= octree.nodeCount) continue;
     
-    float dist = length(worldPos - p.position);
+    OctreeNode node = octreeNodes[nodeIdx];
     
-    if(dist < gatherRadius)
+    // AABB-sphere intersection test: cull nodes that don't overlap gather sphere
+    float3 nodeMin = node.center - float3(node.halfSize);
+    float3 nodeMax = node.center + float3(node.halfSize);
+    float3 closest = clamp(worldPos, nodeMin, nodeMax);
+    float distToNode = length(worldPos - closest);
+
+    // Node too far, skip entire subtree since children will be AT MIMNIMUM parents distance away
+    if(distToNode > gatherRadius)
+      continue;  
+    
+    if(node.childIndex == 0)  // Leaf node: check photons
     {
-      float3 power = unpackRGB9E5(p.powerPacked);
-      
-      float normalizedDist = dist / gatherRadius;
-      float weight = exp(-3.0 * normalizedDist * normalizedDist);
-      
-      irradiance += power * weight;
-      photonsFound++;
-      
-      // Exit early when we have enough
-      if(photonsFound >= pushConst.photonGatherCount)
-        break;
+      for(uint i = 0; i < node.photonCount; i++)
+      {
+      // WE ACCESS PHOTONBUFFER ON GPU VIA INDICES STORED IN OCTREE NODE!!!
+        Photon p = photonBuffer[node.photonStart + i];
+        float dist = length(worldPos - p.position);
+        
+        if(dist < gatherRadius)
+        {
+          // Unpack photon power and apply Gaussian distance weighting
+          float3 power = unpackRGB9E5(p.powerPacked);
+          float normalizedDist = dist / gatherRadius;
+          float weight = exp(-3.0 * normalizedDist * normalizedDist);
+          
+          irradiance += power * weight;
+          photonsFound++;
+        }
+      }
+    }
+    else  // Internal node: push children onto stack
+    {
+      // Children are guaranteed consecutive due to octree construction fix
+      for(int i = 0; i < 8; i++)
+      {
+        if(stackPtr < 256)
+          stack[stackPtr++] = node.childIndex + i;
+      }
     }
   }
   
+  // Convert flux to irradiance (power per unit area)
   if(photonsFound > 0)
   {
     irradiance /= (PI * gatherRadius * gatherRadius);
@@ -272,7 +311,8 @@ float3 gatherPhotons(float3 worldPos, float3 worldNormal)
   return irradiance;
 }
 
-// PHOTON TRACING RAY GENERATION
+
+// PHOTON TRACING RAY GENERATION FROM A GIVEN SINGLE DIRECT LIGHT
 [shader("raygeneration")]
 void photonRayGen()
 {
@@ -280,7 +320,7 @@ void photonRayGen()
   uint2 launchSize = DispatchRaysDimensions().xy;
   uint photonID = launchID.y * launchSize.x + launchID.x;
   
-  if(photonID >= pushConst.photonsPerLight)
+  if(photonID >= 10000000)
     return;
   
   GltfSceneInfo sceneInfo = pushConst.sceneInfoAddress[0];
@@ -312,17 +352,20 @@ void photonRayGen()
     ray.Origin = float3(0, 0, 0) + diskOffset - light.direction * 10.0;
     ray.Direction = light.direction;
   }
-  else if(light.type == GltfLightType::ePoint)
-  {
-    ray.Origin = light.position;
-    float3 randomDir = randomHemisphere(float3(0, 1, 0), rng);
-    if(randomFloat(rng) > 0.5)
-      randomDir = -randomDir;
-    ray.Direction = randomDir;
-    
-    // Account for sphere solid angle
-    photonPower *= 4.0 * PI;
-  }
+else if(light.type == GltfLightType::ePoint)
+{
+  ray.Origin = light.position;
+  
+  // Generate UNIFORM random direction on full sphere
+  float z = randomFloat(rng) * 2.0 - 1.0;  // -1 to 1
+  float a = randomFloat(rng) * 2.0 * PI;   // 0 to 2 pi
+  float r = sqrt(1.0 - z * z);
+  
+  ray.Direction = float3(r * cos(a), r * sin(a), z);
+  
+  // Account for sphere solid angle
+  photonPower *= 4.0 * PI;
+}
   else if(light.type == GltfLightType::eSpot)
   {
     // ADD spot light support
@@ -354,7 +397,7 @@ void photonRayGen()
   }
   
   ray.TMin = 0.001;
-  ray.TMax = INFINITE;
+  ray.TMax = INFINITE;  // keep photon rays goin till they hit somethin
   
   HitPayload payload;
   payload.color = photonPower;  
@@ -364,7 +407,7 @@ void photonRayGen()
   TraceRay(topLevelAS, RAY_FLAG_FORCE_OPAQUE, 0xff, 0, 0, 0, ray, payload);
 }
 
-// Ray generation shader - entry point for each pixel
+// Ray generation shader, entry point for each pixel from camera
 [shader("raygeneration")]
 void rgenMain()
 {
@@ -374,6 +417,7 @@ void rgenMain()
 
     // Retrieve scene information from push constants
     GltfSceneInfo sceneInfo = pushConst.sceneInfoAddress[0];
+
 
     // Set ray tracing flags (0 = no special flags)
     const uint rayFlags = 0;
@@ -427,140 +471,189 @@ void rgenMain()
     outImage[int2(launchID)] = float4(color, 1.0);
 }
 
-// Closest hit shader - called when ray hits geometry
+// Closest hit shader, called when ray hits geometry
 [shader("closesthit")]
 void rchitMain(inout HitPayload payload, in BuiltInTriangleIntersectionAttributes attr)
 {
+// ===== PHOTON RAY HANDLING =====
+const int MAX_PHOTON_BOUNCES = 5;
 
-   // Check if this is a photon tracing ray (hacky but simple)
-  bool isPhotonRay = (payload.depth == PHOTON_RAY_MARKER); // Photon IDs are large
-  if(isPhotonRay && pushConst.usePhotonMapping == 1)
+bool isPhotonRay = (payload.depth >= PHOTON_RAY_MARKER) && 
+                   (payload.depth < PHOTON_RAY_MARKER + MAX_PHOTON_BOUNCES);
+
+if(isPhotonRay && pushConst.usePhotonMapping == 1)
+{
+  // Increment depth counter
+  payload.depth++;
+  
+  // Check if we've exceeded max bounces
+  // This marked approach is dirty, but it'll do the trick for now.
+  // Later create seperate photon payload.
+  if(payload.depth >= PHOTON_RAY_MARKER + MAX_PHOTON_BOUNCES)
   {
-    // PHOTON STORAGE PATH
-    
-    // Get hit information
-    float3 barycentrics = float3(1 - attr.barycentrics.x - attr.barycentrics.y, 
-                                 attr.barycentrics.x, attr.barycentrics.y);
-    
-    uint instanceID = InstanceIndex();
-    uint triID = PrimitiveIndex();
-    
-    GltfSceneInfo sceneInfo = pushConst.sceneInfoAddress[0];
-    GltfInstance instance = sceneInfo.instances[instanceID];
-    GltfMesh mesh = sceneInfo.meshes[instance.meshIndex];
-    
-    // Get world position
-    int3 indices = getTriangleIndices(mesh.gltfBuffer, mesh.triMesh, triID);
-    float3 pos = getTriangleAttribute<float3>(mesh.gltfBuffer, mesh.triMesh.positions, 
-                                              indices, barycentrics);
-    float3 worldPos = float3(mul(float4(pos, 1.0), ObjectToWorld4x3()));
-    
-    // Store photon atomically
+    return;  // Terminate
+  }
+  
+  
+  // Get hit information
+  float3 barycentrics = float3(1 - attr.barycentrics.x - attr.barycentrics.y, 
+                               attr.barycentrics.x, attr.barycentrics.y);
+  
+  uint instanceID = InstanceIndex();
+  uint triID = PrimitiveIndex();
+  
+  GltfSceneInfo sceneInfo = pushConst.sceneInfoAddress[0];
+  GltfInstance instance = sceneInfo.instances[instanceID];
+  GltfMesh mesh = sceneInfo.meshes[instance.meshIndex];
+  GltfMetallicRoughness material = sceneInfo.materials[instance.materialIndex];
+  
+  int3 indices = getTriangleIndices(mesh.gltfBuffer, mesh.triMesh, triID);
+  float3 pos = getTriangleAttribute<float3>(mesh.gltfBuffer, mesh.triMesh.positions, 
+                                            indices, barycentrics);
+  float3 nrm = getTriangleAttribute<float3>(mesh.gltfBuffer, mesh.triMesh.normals, 
+                                            indices, barycentrics);
+  float3 worldPos = float3(mul(float4(pos, 1.0), ObjectToWorld4x3()));
+  float3 worldNormal = normalize(mul(WorldToObject4x3(), nrm).xyz);
+  
+  float3 albedo = material.baseColorFactor.xyz;
+  float metallic = material.metallicFactor;
+  float roughness = material.roughnessFactor;
+  
+  // ===== INITIALIZE RNG =====
+  RandomState rng;
+  uint seed = asuint(worldPos.x) ^ asuint(worldPos.y) ^ asuint(worldPos.z) ^ asuint(RayTCurrent());
+  initRandom(rng, seed);
+  
+  // ===== BRDF INTERACTION =====
+  float3 reflectedPower = payload.color * albedo;
+  
+  // ===== STORE PHOTON =====
+  if(metallic < 0.5)
+  {
     uint photonIndex;
     InterlockedAdd(photonCounter[0], 1, photonIndex);
     
-    if(photonIndex < pushConst.photonsPerLight)
+    if(photonIndex < 10000000)
     {
       Photon p;
       p.position = worldPos;
       p.direction = -WorldRayDirection();
-      p.powerPacked = packRGB9E5(payload.color);
+      p.powerPacked = packRGB9E5(reflectedPower); // reflectedPower = payload.color * albedo
       p._padding = 0;
       
       photonBuffer[photonIndex] = p;
     }
-    
-    // Don't continue bouncing for now
-    return;
+  }
+  
+  // ===== RUSSIAN ROULETTE =====
+  // Use material ALBEDO for survival odds muahaha
+  float maxAlbedo = max(max(albedo.r, albedo.g), albedo.b);
+  float survivalProb = min(maxAlbedo, 0.95);  
+  
+  if(randomFloat(rng) > survivalProb)
+  {
+    return;  // Terminate
+  }
+  // ===== COMPENSATE (boost surviving photons to account for dead ones) =====
+  payload.color = reflectedPower / survivalProb;
+
+
+  // ===== SAMPLE NEW DIRECTION =====
+  // reflect about the surface normal if metallic, otherwise scatter
+  // randomly using random point on hemisphere
+  float3 newDirection;
+  if(metallic > 0.5)
+  {
+    newDirection = reflect(WorldRayDirection(), worldNormal);
+  }
+  else
+  {
+    newDirection = randomHemisphere(worldNormal, rng);
+  }
+  
+  // ===== TRACE NEXT BOUNCE =====
+  RayDesc nextRay;
+  nextRay.Origin = worldPos + worldNormal * 0.001;
+  nextRay.Direction = newDirection;
+  nextRay.TMin = 0.001;
+  nextRay.TMax = INFINITE;
+  TraceRay(topLevelAS, RAY_FLAG_FORCE_OPAQUE, 0xff, 0, 0, 0, nextRay, payload);
+  
+  return;
+}
+
+  // ===== CAMERA RAY HANDLING =====
+  float3 barycentrics = float3(1 - attr.barycentrics.x - attr.barycentrics.y, 
+                               attr.barycentrics.x, attr.barycentrics.y);
+  
+  uint instanceID = InstanceIndex();
+  uint meshID = InstanceID();
+  uint triID = PrimitiveIndex();
+
+  GltfSceneInfo sceneInfo = pushConst.sceneInfoAddress[0];
+  GltfInstance instance = sceneInfo.instances[instanceID];
+  GltfMesh mesh = sceneInfo.meshes[instance.meshIndex];
+  GltfMetallicRoughness material = sceneInfo.materials[instance.materialIndex];
+
+  int3 indices = getTriangleIndices(mesh.gltfBuffer, mesh.triMesh, triID);
+  float3 pos = getTriangleAttribute<float3>(mesh.gltfBuffer, mesh.triMesh.positions, 
+                                            indices, barycentrics);
+  float3 nrm = getTriangleAttribute<float3>(mesh.gltfBuffer, mesh.triMesh.normals, 
+                                            indices, barycentrics);
+  float3 worldPos = float3(mul(float4(pos, 1.0), ObjectToWorld4x3()));
+  float3 worldNormal = normalize(mul(WorldToObject4x3(), nrm).xyz);
+
+  float3 albedo = material.baseColorFactor.xyz;
+  float metallic = material.metallicFactor;
+  float roughness = material.roughnessFactor;
+  
+  GltfPunctual light = processLight(sceneInfo, worldPos);
+
+  float3 N = normalize(worldNormal);
+  float3 V = -WorldRayDirection();
+  float3 L = normalize(light.direction);
+
+  float3 color = pbrMetallicRoughness(albedo, metallic, roughness, N, V, L);
+  color *= light.color * light.intensity;
+
+  if(pushConst.usePhotonMapping == 1)
+  {
+    float3 indirectLight = gatherPhotonsOctree(worldPos, N);
+    color += indirectLight * albedo / PI;
   }
 
-    // Get barycentric coordinates (pts position in triangle using weights based on tris 3 vertices)
-    float3 barycentrics = float3(1 - attr.barycentrics.x - attr.barycentrics.y, attr.barycentrics.x, attr.barycentrics.y);
-    
-    // Get instance and primitive information
-    // raw functions automatically available in rt shaders!
-    uint instanceID = InstanceIndex();
-    uint meshID = InstanceID(); // corresponds to mesh index for each instance
-    uint triID = PrimitiveIndex();
-
-    GltfSceneInfo sceneInfo = pushConst.sceneInfoAddress[0];
-    GltfInstance instance = sceneInfo.instances[instanceID];
-    GltfMesh mesh = sceneInfo.meshes[instance.meshIndex];
-    GltfMetallicRoughness material = sceneInfo.materials[instance.materialIndex];
-
-    // Get world position and normal
-    int3 indices = getTriangleIndices(mesh.gltfBuffer, mesh.triMesh, triID);
-    float3 pos = getTriangleAttribute<float3>(mesh.gltfBuffer, mesh.triMesh.positions, indices, barycentrics);
-    float3 nrm = getTriangleAttribute<float3>(mesh.gltfBuffer, mesh.triMesh.normals, indices, barycentrics);
-    float3 worldPos = float3(mul(float4(pos, 1.0), ObjectToWorld4x3()));
-    float3 worldNormal = normalize(mul(WorldToObject4x3(), nrm).xyz);
-
-    // Simple PBR shading
-    float3 albedo = material.baseColorFactor.xyz;
-    float metallic = material.metallicFactor;
-    float roughness = material.roughnessFactor;
-    
-    // Process light with sky override and distance attenuation
-    GltfPunctual light = processLight(sceneInfo, worldPos);
-
-    float3 N = normalize(worldNormal);
-    float3 V = -WorldRayDirection();
-    float3 L = normalize(light.direction);
-
-    // Test for shadows
-    float shadowFactor = testShadow(worldPos, N, light.direction, light);
-
-    // Calculate PBR lighting with shadow factor
-    float3 color = pbrMetallicRoughness(albedo, metallic, roughness, N, V, L);
-    color *= light.color * light.intensity * shadowFactor;
-
-    if(pushConst.usePhotonMapping == 1)
-    {
-      float3 indirectLight = gatherPhotons(worldPos, N);
-      color += indirectLight * albedo / PI; // Simple diffuse reflection
-    }
-
-  // Handle reflection based on material properties
   float3 reflectionColor = float3(0, 0, 0);
 
 #ifdef REFLECTION_RECURSIVE
-  // Recursive reflection
   if(payload.depth < pushConst.depthMax && metallic > 0.01)
   {
-    // Calculate reflection direction
     float3 reflectionDir = reflect(-V, N);
 
-    // Create reflection ray
     RayDesc reflectionRay;
-    reflectionRay.Origin    = worldPos + N * 0.001;  // Offset to avoid self-intersection
+    reflectionRay.Origin    = worldPos + N * 0.001;
     reflectionRay.Direction = reflectionDir;
     reflectionRay.TMin      = 0.001;
     reflectionRay.TMax      = INFINITE;
 
-    // Create payload for reflection ray
     HitPayload reflectionPayload;
     reflectionPayload.color  = float3(0, 0, 0);
     reflectionPayload.weight = payload.weight * metallic;
     reflectionPayload.depth  = payload.depth + 1;
 
-    // Trace reflection ray
     TraceRay(topLevelAS, 0, 0xff, 0, 0, 0, reflectionRay, reflectionPayload);
 
-    // Add reflection contribution
     reflectionColor = reflectionPayload.color * metallic;
   }
 
   payload.color = color + reflectionColor;
 
 #else
-  // Iterative reflection - set up next iteration
-  payload.rayOrigin    = worldPos;        // + N * 0.001;
-  payload.rayDirection = reflect(-V, N);  // Calculate reflection direction
+  payload.rayOrigin    = worldPos;
+  payload.rayDirection = reflect(-V, N);
   payload.color        = color;
   payload.weight *= metallic;
   payload.depth++;
 #endif
-
 }
 
 // Miss shader - called when ray doesn't hit any geometry

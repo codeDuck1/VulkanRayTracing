@@ -27,13 +27,45 @@ NAMESPACE_SHADERIO_BEGIN()
 // Binding Points
 enum BindingPoints
 {
-  eTextures = 0,  // Binding point for textures
-  eOutImage,      // Binding point for output image
-  eTlas,          // Top-level acceleration structure
-  ePhotonBuffer,
-  ePhotonCounter
+  // Set 0 (textures)
+  eTextures = 0,
+
+  // Set 1 (ray tracing resources)
+  eTlas          = 0,  // Same binding as eTextures, but different set
+  eOutImage      = 1,
+  ePhotonBuffer  = 2,
+  ePhotonCounter = 3,
+  eOctreeNodes   = 4,
+  eOctreeParams  = 5
 };
 
+
+struct Photon
+{
+  float3 position;     // 12 bytes - world position where photon hit
+  uint   powerPacked;  // 4 bytes  - RGB9E5 packed photon power
+  float3 direction;    // 12 bytes - incoming light direction
+  float  _padding;     // 4 bytes  - alignment
+};
+
+struct OctreeNode
+{
+  float3 center;    // Node center position
+  float  halfSize;  // Half the size of the node's cube
+
+  uint childIndex;   // Index to first child (0 = leaf node)
+  uint photonStart;  // Start index in photon list (for leaf nodes)
+  uint photonCount;  // Number of photons in this node
+  uint _padding;
+};
+
+struct PhotonOctree
+{
+  float3 minBound;  // Octree bounds
+  float3 maxBound;
+  uint   nodeCount;  // Total number of nodes
+  uint   maxDepth;   // Maximum depth of tree
+};
 
 struct TutoPushConstant
 {
@@ -44,18 +76,9 @@ struct TutoPushConstant
   int depthMax = 3; // maximum reflection depth
 
 
-  int usePhotonMapping;   // toggle photon mapping
-  int photonsPerLight;    //how many photons to trace
-  int photonGatherCount;  // how many photons to gather (K-nearest)
+  int usePhotonMapping;   
+  int photonsPerLight;    
+  float photonGatherRadius; // at each camera hit point, radius to gather photons 
 };
-
-struct Photon
-{
-  float3 position;     // 12 bytes - world position where photon hit
-  uint   powerPacked;  // 4 bytes  - RGB9E5 packed photon power
-  float3 direction;    // 12 bytes - incoming light direction
-  float  _padding;     // 4 bytes  - alignment
-};
-
 NAMESPACE_SHADERIO_END()
 #endif  // SHADERIO_H
