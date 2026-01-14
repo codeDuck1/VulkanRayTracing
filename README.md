@@ -1,5 +1,5 @@
+# This is the tutorial I followed to get basic ray tracing set up. Photon Mapping was implemented on my own as an extension- it is not included in this tutorial.
 ![logo](http://nvidianews.nvidia.com/_ir/219/20157/NV_Designworks_logo_horizontal_greenblack.png)
-
 # NVIDIA Vulkan Ray Tracing Tutorials (v2.0)
 
 ![resultRaytraceShadowMedieval](/docs/images/tuto.png)
